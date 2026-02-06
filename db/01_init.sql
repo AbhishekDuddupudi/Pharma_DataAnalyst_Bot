@@ -1,0 +1,6 @@
+-- ================================================================
+-- DEPRECATED – This file is intentionally empty.
+-- Schema  → 00_schema.sql
+-- Seed    → 01_seed.sql
+-- Indexes → 02_indexes.sql
+-- ================================================================

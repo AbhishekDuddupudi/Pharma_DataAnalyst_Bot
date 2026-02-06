@@ -1,0 +1,53 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Base resets ──────────────────────────────────────── */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  min-height: 100dvh;
+}
+
+/* Smooth scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #2a2d3a;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3a3d4a;
+}
+
+/* ── Utility layers ──────────────────────────────────── */
+
+@layer components {
+  .btn-primary {
+    @apply rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white
+           transition-colors hover:bg-accent-hover focus-visible:outline-none
+           focus-visible:ring-2 focus-visible:ring-accent/50;
+  }
+
+  .input-base {
+    @apply w-full rounded-lg border border-border bg-surface-raised px-3 py-2
+           text-sm text-neutral-200 placeholder-neutral-500
+           transition-colors focus:border-accent focus:outline-none
+           focus:ring-1 focus:ring-accent/40;
+  }
+}

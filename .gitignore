@@ -1,0 +1,39 @@
+# ──────────────── Python ────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# ──────────────── Node / Frontend ────────────────
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# ──────────────── Environment ────────────────
+.env
+.env.local
+.env.*.local
+
+# ──────────────── IDE ────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ──────────────── Docker ────────────────
+docker-compose.override.yml
+
+# ──────────────── Misc ────────────────
+*.log
+coverage/
+htmlcov/
