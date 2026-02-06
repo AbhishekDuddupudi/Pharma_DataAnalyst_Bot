@@ -1,13 +1,33 @@
-import { Link, useLocation } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
+import type { Session } from "../api/client";
 
-const NAV_ITEMS = [
-  { label: "Chat", path: "/" },
-  // Future: { label: "History", path: "/history" },
-] as const;
+interface SidebarProps {
+  sessions: Session[];
+  activeSessionId: number | null;
+  onSelectSession: (id: number) => void;
+  onNewChat: () => void;
+}
 
-export default function Sidebar() {
-  const { pathname } = useLocation();
+function formatTime(iso: string): string {
+  const d = new Date(iso);
+  const now = new Date();
+  const diffMs = now.getTime() - d.getTime();
+  const diffMin = Math.floor(diffMs / 60_000);
+  if (diffMin < 1) return "just now";
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  const diffDay = Math.floor(diffHr / 24);
+  if (diffDay < 7) return `${diffDay}d ago`;
+  return d.toLocaleDateString();
+}
+
+export default function Sidebar({
+  sessions,
+  activeSessionId,
+  onSelectSession,
+  onNewChat,
+}: SidebarProps) {
   const { user, logout } = useAuth();
 
   const handleLogout = async () => {
@@ -23,24 +43,45 @@ export default function Sidebar() {
         </span>
       </div>
 
-      {/* Navigation */}
-      <nav className="flex-1 space-y-1 px-3 py-4">
-        {NAV_ITEMS.map(({ label, path }) => {
-          const active = pathname === path;
+      {/* New Chat button */}
+      <div className="px-3 pt-3">
+        <button
+          onClick={onNewChat}
+          className="w-full rounded-md border border-border px-3 py-2 text-left text-sm font-medium text-neutral-300 transition-colors hover:bg-surface-overlay hover:text-white"
+        >
+          + New chat
+        </button>
+      </div>
+
+      {/* Session list */}
+      <nav className="flex-1 space-y-0.5 overflow-y-auto px-3 py-3">
+        {sessions.map((s) => {
+          const active = s.id === activeSessionId;
           return (
-            <Link
-              key={path}
-              to={path}
-              className={`block rounded-md px-3 py-2 text-sm font-medium transition-colors ${
+            <button
+              key={s.id}
+              onClick={() => onSelectSession(s.id)}
+              className={`flex w-full flex-col rounded-md px-3 py-2 text-left transition-colors ${
                 active
                   ? "bg-surface-overlay text-white"
                   : "text-neutral-400 hover:bg-surface-overlay hover:text-neutral-200"
               }`}
             >
-              {label}
-            </Link>
+              <span className="truncate text-sm">
+                {s.title ?? "Untitled chat"}
+              </span>
+              <span className="mt-0.5 text-xs text-neutral-500">
+                {formatTime(s.updated_at)}
+              </span>
+            </button>
           );
         })}
+
+        {sessions.length === 0 && (
+          <p className="px-3 py-4 text-center text-xs text-neutral-500">
+            No conversations yet
+          </p>
+        )}
       </nav>
 
       {/* Footer – user info + logout */}

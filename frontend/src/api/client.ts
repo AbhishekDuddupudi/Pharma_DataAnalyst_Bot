@@ -78,4 +78,51 @@ export function fetchMe(): Promise<MeResponse> {
   return request<MeResponse>("/auth/me");
 }
 
+/* ── Chat sessions & messages ──────────────────────── */
+
+export interface Session {
+  id: number;
+  user_id: number;
+  title: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface Message {
+  id: number;
+  session_id: number;
+  role: "user" | "assistant";
+  content: string;
+  sql_query: string | null;
+  created_at: string;
+}
+
+export interface ChatResponse {
+  session_id: number;
+  answer: string;
+  messages: Message[];
+}
+
+export function getSessions(): Promise<Session[]> {
+  return request<Session[]>("/sessions");
+}
+
+export function createSession(): Promise<Session> {
+  return request<Session>("/sessions", { method: "POST" });
+}
+
+export function getSessionMessages(sessionId: number): Promise<Message[]> {
+  return request<Message[]>(`/sessions/${sessionId}/messages`);
+}
+
+export function sendChat(body: {
+  session_id?: number;
+  message: string;
+}): Promise<ChatResponse> {
+  return request<ChatResponse>("/chat", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
 export default request;

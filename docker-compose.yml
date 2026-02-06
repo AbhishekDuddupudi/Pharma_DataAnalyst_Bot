@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   db:
     image: postgres:16-alpine
@@ -14,7 +12,7 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./db:/docker-entrypoint-initdb.d
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pharma}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pharma} -d ${POSTGRES_DB:-pharma_db}"]
       interval: 5s
       timeout: 3s
       retries: 5
