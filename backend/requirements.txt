@@ -2,6 +2,8 @@ fastapi==0.115.*
 uvicorn[standard]==0.34.*
 pydantic==2.*
 pydantic-settings==2.*
+pydantic[email]
 sqlalchemy[asyncio]==2.*
 asyncpg==0.30.*
 python-dotenv==1.*
+bcrypt==4.*

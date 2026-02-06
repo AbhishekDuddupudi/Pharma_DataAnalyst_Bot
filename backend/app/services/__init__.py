@@ -1,1 +1,1 @@
-# services – DB access, LLM client, streaming helpers (coming soon)
+# services – auth, DB access, LLM client, streaming helpers

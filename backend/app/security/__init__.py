@@ -1,1 +1,1 @@
-# security – auth dependencies (coming soon)
+# security – cookie config, auth dependencies, RBAC (future)

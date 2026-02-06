@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     # ── CORS ──────────────────────────────────────────────────────
     CORS_ORIGINS: str = "http://localhost:5173"
 
+    # ── Auth / Sessions ───────────────────────────────────────────
+    SESSION_TTL_DAYS: int = 7
+
     # ── OpenAI / LLM ─────────────────────────────────────────────
     OPENAI_API_KEY: str = ""
 

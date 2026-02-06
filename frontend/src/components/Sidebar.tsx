@@ -1,4 +1,5 @@
 import { Link, useLocation } from "react-router-dom";
+import { useAuth } from "../auth/AuthContext";
 
 const NAV_ITEMS = [
   { label: "Chat", path: "/" },
@@ -7,6 +8,11 @@ const NAV_ITEMS = [
 
 export default function Sidebar() {
   const { pathname } = useLocation();
+  const { user, logout } = useAuth();
+
+  const handleLogout = async () => {
+    await logout();
+  };
 
   return (
     <aside className="flex w-60 flex-col border-r border-border bg-surface-raised">
@@ -37,9 +43,19 @@ export default function Sidebar() {
         })}
       </nav>
 
-      {/* Footer */}
-      <div className="border-t border-border px-5 py-3">
-        <span className="text-xs text-neutral-500">v0.1.0</span>
+      {/* Footer – user info + logout */}
+      <div className="space-y-2 border-t border-border px-5 py-3">
+        {user && (
+          <p className="truncate text-xs text-neutral-400">
+            {user.display_name ?? user.email}
+          </p>
+        )}
+        <button
+          onClick={handleLogout}
+          className="text-xs text-neutral-500 transition-colors hover:text-neutral-300"
+        >
+          Logout
+        </button>
       </div>
     </aside>
   );

@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 import { health } from "../api/client";
+import { useAuth } from "../auth/AuthContext";
 
 export default function Chat() {
+  const { user } = useAuth();
   const [backendOk, setBackendOk] = useState<boolean | null>(null);
 
   useEffect(() => {
@@ -21,7 +23,7 @@ export default function Chat() {
           {backendOk === null
             ? "Connecting..."
             : backendOk
-              ? "Backend connected"
+              ? `Connected as ${user?.display_name ?? user?.email ?? ""}`
               : "Backend unreachable"}
         </span>
       </header>

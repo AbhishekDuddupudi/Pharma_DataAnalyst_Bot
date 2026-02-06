@@ -1,6 +1,35 @@
-import { Link } from "react-router-dom";
+import { useState } from "react";
+import { Navigate, useNavigate } from "react-router-dom";
+import { useAuth } from "../auth/AuthContext";
 
 export default function Login() {
+  const { user, loading, error, login } = useAuth();
+  const navigate = useNavigate();
+
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  // Already authenticated — go to chat
+  if (user && !loading) {
+    return <Navigate to="/" replace />;
+  }
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!email || !password) return;
+
+    setSubmitting(true);
+    try {
+      await login(email, password);
+      navigate("/", { replace: true });
+    } catch {
+      // error is set by AuthContext
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   return (
     <div className="flex min-h-screen items-center justify-center bg-surface">
       <div className="w-full max-w-sm space-y-6 rounded-xl border border-border bg-surface-raised p-8">
@@ -14,20 +43,26 @@ export default function Login() {
           </p>
         </div>
 
-        {/* Form (placeholder – no submit logic) */}
-        <form
-          onSubmit={(e) => e.preventDefault()}
-          className="space-y-4"
-        >
+        {/* Error banner */}
+        {error && (
+          <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-center text-xs text-red-400">
+            {error}
+          </div>
+        )}
+
+        {/* Form */}
+        <form onSubmit={handleSubmit} className="space-y-4">
           <div className="space-y-1.5">
             <label className="block text-xs font-medium text-neutral-400">
               Email
             </label>
             <input
               type="email"
-              placeholder="you@example.com"
+              required
+              autoComplete="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
               className="input-base"
-              disabled
             />
           </div>
 
@@ -37,22 +72,22 @@ export default function Login() {
             </label>
             <input
               type="password"
-              placeholder="••••••••"
+              required
+              autoComplete="current-password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
               className="input-base"
-              disabled
             />
           </div>
 
-          <button type="submit" disabled className="btn-primary w-full opacity-60">
-            Sign in
+          <button
+            type="submit"
+            disabled={submitting}
+            className="btn-primary w-full disabled:opacity-50"
+          >
+            {submitting ? "Signing in..." : "Sign in"}
           </button>
         </form>
-
-        <p className="text-center text-xs text-neutral-500">
-          <Link to="/" className="text-accent hover:text-accent-hover transition-colors">
-            Back to chat
-          </Link>
-        </p>
       </div>
     </div>
   );

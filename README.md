@@ -43,10 +43,13 @@ Once running:
 
 ## API Endpoints
 
-| Method | Path            | Description                |
-|--------|-----------------|----------------------------|
-| GET    | `/api/health`   | Health check               |
-| GET    | `/api/version`  | App version and info       |
+| Method | Path              | Auth | Description                    |
+|--------|-------------------|------|--------------------------------|
+| GET    | `/api/health`     | No   | Health check                   |
+| GET    | `/api/version`    | No   | App version and info           |
+| POST   | `/api/auth/login` | No   | Authenticate (email + password)|
+| POST   | `/api/auth/logout`| No   | Clear session                  |
+| GET    | `/api/auth/me`    | No   | Current user (or null)         |
 
 ---
 
@@ -71,7 +74,8 @@ Once running:
 ├── db/                       # Postgres init scripts
 │   ├── 00_schema.sql         # Star-schema DDL
 │   ├── 01_seed.sql           # Deterministic data generation
-│   └── 02_indexes.sql        # Analytics indexes
+│   ├── 02_indexes.sql        # Analytics indexes
+│   └── 03_auth.sql           # Auth tables + demo user seed
 ├── docker-compose.yml
 ├── .env.example
 └── README.md
@@ -182,8 +186,34 @@ Scripts in `db/` run alphabetically when the container is first created:
 1. `00_schema.sql` — tables, constraints, extensions
 2. `01_seed.sql` — dimension + fact data generation (PL/pgSQL)
 3. `02_indexes.sql` — analytics indexes + `ANALYZE`
+4. `03_auth.sql` — auth tables (`app_user`, `user_session`) + demo user
 
 > To re-seed: `docker-compose down -v && docker-compose up --build`
+
+---
+
+## Authentication
+
+The app uses **server-side sessions** stored in Postgres with **httpOnly cookies**.
+
+### Flow
+
+1. `POST /api/auth/login` — validates credentials, creates a `user_session` row, sets `session_id` cookie.
+2. All subsequent requests include the cookie automatically (`credentials: "include"`).
+3. `GET /api/auth/me` — returns the current user from the session, or `{ user: null }`.
+4. `POST /api/auth/logout` — deletes the session row and clears the cookie.
+
+### Demo User
+
+A demo account is seeded automatically by `db/03_auth.sql`:
+
+| Field    | Value              |
+|----------|--------------------|
+| Email    | `demo@example.com` |
+| Password | `demo123`          |
+
+> These credentials are for local development only.
+> They are **not** displayed anywhere in the UI.
 
 ---
 
