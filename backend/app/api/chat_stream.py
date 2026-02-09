@@ -4,34 +4,48 @@ SSE streaming chat endpoint.
 POST /api/chat/stream
   → text/event-stream with progress statuses, tokens, and artifacts.
 
-Uses the same session / message persistence as the non-streaming endpoint.
+Uses the 10-node agentic workflow and persists results to chat_history.
+
+P6 add-ons:
+  • Emits request_id event (from X-Request-Id middleware).
+  • Emits metrics event before complete.
+  • Emits retry / audit SSE events.
+  • Checks request.is_disconnected() for cancel correctness.
+  • Complete event carries ok, blocked, needs_clarification flags.
+  • Audit lifecycle: create on start, finalize on success/error.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import traceback
+import time
 from typing import Any, AsyncGenerator
 
-from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from app.security.cookies import SESSION_COOKIE
 from app.security.deps import require_auth
-from app.services.auth_service import get_session as get_auth_session, get_user_by_id
 from app.services.chat_history import (
     add_message,
     create_session,
+    get_recent_messages,
     get_session,
     maybe_auto_title,
 )
+from app.services.audit import (
+    create_audit_start,
+    finalize_audit_success,
+    finalize_audit_error,
+)
+from app.agent.workflow import run_workflow
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 
 router = APIRouter(tags=["chat"])
+
 
 # ── Request schema ───────────────────────────────────────────────
 
@@ -39,22 +53,6 @@ router = APIRouter(tags=["chat"])
 class StreamChatRequest(BaseModel):
     session_id: int | None = None
     message: str
-
-
-# ── Pipeline steps ───────────────────────────────────────────────
-
-PIPELINE_STEPS = [
-    ("preprocess_input", "Preprocessing your question…"),
-    ("analysis_planner", "Planning the analysis…"),
-    ("sql_generator", "Generating SQL query…"),
-    ("sql_validator", "Validating SQL…"),
-    ("sql_executor", "Running query…"),
-    ("response_synthesizer", "Writing answer…"),
-]
-
-# Simulated delay between steps (seconds) — keeps UI feeling real
-_STEP_DELAY = 0.15
-_TOKEN_DELAY = 0.03
 
 
 # ── SSE helpers ──────────────────────────────────────────────────
@@ -70,16 +68,30 @@ def _sse(event: str, data: dict) -> str:
 
 
 async def _generate_stream(
+    request: Request,
     user_id: int,
     body: StreamChatRequest,
 ) -> AsyncGenerator[str, None]:
     """
     Async generator that yields SSE frames.
-    Handles session creation, message persistence, and the stub pipeline.
+    Runs the real 10-node workflow via emit callback.
     """
     session_id: int | None = None
+    cancelled = False
+
+    # Queue for workflow → SSE bridge
+    queue: asyncio.Queue[tuple[str, dict] | None] = asyncio.Queue()
+
+    async def emit(event: str, data: dict) -> None:
+        """Callback passed to the workflow. Enqueues SSE events."""
+        await queue.put((event, data))
 
     try:
+        # ── Emit request_id ───────────────────────────────────
+        request_id = getattr(request.state, "request_id", None) or "unknown"
+        if request_id != "unknown":
+            yield _sse("request_id", {"request_id": request_id})
+
         # ── Resolve / create session ──────────────────────────
         if body.session_id is not None:
             session = await get_session(user_id, body.session_id)
@@ -91,78 +103,161 @@ async def _generate_stream(
             new_session = await create_session(user_id)
             session_id = new_session["id"]
 
-        # Emit session event first
         yield _sse("session", {"session_id": session_id})
 
         # ── Store user message ────────────────────────────────
         await add_message(session_id, "user", body.message)
         await maybe_auto_title(session_id)
 
-        # ── Pipeline status steps ─────────────────────────────
-        for step_name, step_msg in PIPELINE_STEPS:
-            yield _sse("status", {"step": step_name, "message": step_msg})
-            await asyncio.sleep(_STEP_DELAY)
+        # ── Load conversation history for context ─────────────
+        history_rows = await get_recent_messages(user_id, session_id, limit=6)
+        history = [{"role": h["role"], "content": h["content"]} for h in history_rows]
 
-        # ── Emit SQL artifact (stub) ──────────────────────────
-        stub_sql = "SELECT 'stub — real agent coming next' AS info;"
-        yield _sse("artifact_sql", {"sql": stub_sql})
+        # ── Create audit log entry ────────────────────────────
+        audit_id: int | None = None
+        try:
+            audit_id = await create_audit_start(
+                request_id=request_id,
+                user_id=user_id,
+                session_id=session_id,
+                mode="stream",
+            )
+        except Exception:
+            logger.warning("Failed to create audit entry", exc_info=True)
 
-        # ── Emit table artifact (stub) ────────────────────────
-        yield _sse("artifact_table", {
-            "columns": ["info"],
-            "rows": [["Stub result — real query coming in P6"]],
-        })
+        # ── Run workflow in a background task ─────────────────
+        # The workflow calls emit() which enqueues events.
+        # We drain the queue and yield SSE frames.
 
-        # ── Emit chart artifact (stub) ────────────────────────
-        yield _sse("artifact_chart", {
-            "chartSpec": {"type": "placeholder", "note": "Chart available in P6"},
-        })
+        workflow_state = None
+        workflow_error: str | None = None
 
-        # ── Stream assistant answer tokens ────────────────────
-        stub_answer = (
-            "I've analyzed your question. "
-            "The data pipeline is being set up — "
-            "once the agent is connected, "
-            "I'll generate real SQL, run it against your database, "
-            "and provide charts and tables. "
-            "Stay tuned!"
-        )
+        async def _run_workflow():
+            nonlocal workflow_state, workflow_error
+            try:
+                workflow_state = await run_workflow(body.message, history, emit)
+            except Exception as exc:
+                workflow_error = str(exc)
+                logger.exception("Workflow error for user %s", user_id)
+            finally:
+                await queue.put(None)  # Sentinel
 
-        # Build full text in memory while streaming tokens
-        full_text_parts: list[str] = []
+        task = asyncio.create_task(_run_workflow())
 
-        for token in _tokenize(stub_answer):
-            yield _sse("token", {"text": token})
-            full_text_parts.append(token)
-            await asyncio.sleep(_TOKEN_DELAY)
+        # ── Drain queue → SSE ─────────────────────────────────
+        while True:
+            # Check for client disconnect
+            if await request.is_disconnected():
+                cancelled = True
+                task.cancel()
+                logger.info("Client disconnected, cancelling workflow")
+                break
 
-        # ── Persist assistant message ─────────────────────────
-        full_text = "".join(full_text_parts)
-        await add_message(session_id, "assistant", full_text, sql_query=stub_sql)
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+
+            if item is None:
+                break  # Workflow done
+
+            event, data = item
+            yield _sse(event, data)
+
+        # Wait for task to finish
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # ── Handle error from workflow ────────────────────────
+        if workflow_error:
+            yield _sse("error", {"message": workflow_error})
+            if audit_id:
+                try:
+                    await finalize_audit_error(
+                        audit_id,
+                        error_message=workflow_error,
+                    )
+                except Exception:
+                    logger.warning("Audit finalize (error) failed", exc_info=True)
+            return
+
+        if cancelled:
+            return
+
+        # ── Emit metrics ──────────────────────────────────────
+        if workflow_state:
+            total_ms = round((time.perf_counter() - workflow_state.total_t0) * 1000)
+            timings_ms = {
+                "total_ms": total_ms,
+                "llm_ms": workflow_state.llm_ms,
+                "db_ms": workflow_state.db_ms,
+            }
+
+            yield _sse("metrics", {
+                "total_ms": total_ms,
+                "llm_ms": workflow_state.llm_ms,
+                "db_ms": workflow_state.db_ms,
+                "rows_returned": workflow_state.rows_returned,
+                "tokens_streamed": workflow_state.tokens_streamed,
+                "retries_used": workflow_state.retries_used,
+            })
+
+            # ── Emit audit event ──────────────────────────────
+            yield _sse("audit", {
+                "request_id": request_id,
+                "mode": "stream",
+                "tasks_count": len(workflow_state.tasks),
+                "retries_used": workflow_state.retries_used,
+                "tables_used": workflow_state.tables_used,
+                "safety_checks_passed": not workflow_state.blocked and not workflow_state.rejected,
+            })
+
+            # ── Persist assistant message ─────────────────────
+            sql_queries = "; ".join(t.sql for t in workflow_state.tasks if t.sql)
+            await add_message(
+                session_id,
+                "assistant",
+                workflow_state.answer_text,
+                sql_query=sql_queries or None,
+            )
+
+            # ── Finalize audit ────────────────────────────────
+            if audit_id:
+                try:
+                    await finalize_audit_success(
+                        audit_id,
+                        tasks_count=len(workflow_state.tasks),
+                        retries_used=workflow_state.retries_used,
+                        tables_used=workflow_state.tables_used,
+                        metrics_used=workflow_state.metrics_used,
+                        timings_ms=timings_ms,
+                        rows_returned=workflow_state.rows_returned,
+                    )
+                except Exception:
+                    logger.warning("Audit finalize (success) failed", exc_info=True)
 
         # ── Complete ──────────────────────────────────────────
-        yield _sse("complete", {"ok": True})
+        complete_data: dict[str, Any] = {"ok": True}
+        if workflow_state:
+            if workflow_state.blocked:
+                complete_data["ok"] = False
+                complete_data["blocked"] = True
+                complete_data["reason"] = workflow_state.reject_reason
+            elif workflow_state.needs_clarification:
+                complete_data["ok"] = False
+                complete_data["needs_clarification"] = True
+                complete_data["questions"] = workflow_state.clarification_questions
+            elif workflow_state.rejected:
+                complete_data["ok"] = False
+                complete_data["blocked"] = True
+                complete_data["reason"] = workflow_state.reject_reason
+        yield _sse("complete", complete_data)
 
     except Exception as exc:
         logger.exception("Streaming error for user %s", user_id)
         yield _sse("error", {"message": str(exc)})
-
-
-def _tokenize(text: str) -> list[str]:
-    """
-    Split text into small chunks that feel like token-by-token streaming.
-    Splits on word boundaries, keeping spaces attached.
-    """
-    tokens: list[str] = []
-    current = ""
-    for ch in text:
-        current += ch
-        if ch in (" ", ",", ".", "!", "?", ";", "—", "\n"):
-            tokens.append(current)
-            current = ""
-    if current:
-        tokens.append(current)
-    return tokens
 
 
 # ── Endpoint ─────────────────────────────────────────────────────
@@ -170,6 +265,7 @@ def _tokenize(text: str) -> list[str]:
 
 @router.post("/chat/stream")
 async def chat_stream(
+    request: Request,
     body: StreamChatRequest,
     user: dict[str, Any] = Depends(require_auth),
 ):
@@ -178,11 +274,11 @@ async def chat_stream(
     Returns ``text/event-stream`` with progress, tokens, and artifacts.
     """
     return StreamingResponse(
-        _generate_stream(user["id"], body),
+        _generate_stream(request, user["id"], body),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # disable nginx buffering if present
+            "X-Accel-Buffering": "no",
         },
     )

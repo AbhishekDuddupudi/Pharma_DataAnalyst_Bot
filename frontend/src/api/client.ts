@@ -127,14 +127,73 @@ export function sendChat(body: {
 
 /* ── SSE streaming chat ────────────────────────────── */
 
+export interface SqlTask {
+  title: string;
+  sql: string;
+  error?: string;
+}
+
+export interface TableArtifact {
+  task_title: string;
+  columns: string[];
+  rows: unknown[][];
+  row_count: number;
+  truncated: boolean;
+}
+
+export interface ChartArtifact {
+  available: boolean;
+  chart_type?: string;
+  x_column?: string;
+  y_column?: string;
+  title?: string;
+}
+
+export interface MetricsData {
+  total_ms: number;
+  llm_ms: number;
+  db_ms: number;
+  rows_returned: number;
+  tokens_streamed: number;
+  retries_used: number;
+}
+
+export interface RetryData {
+  type: "validator" | "db";
+  attempt: number;
+  max: number;
+  reason: string;
+}
+
+export interface AuditData {
+  request_id: string;
+  mode: string;
+  tasks_count: number;
+  retries_used: number;
+  tables_used: string[];
+  safety_checks_passed: boolean;
+}
+
+export interface CompleteData {
+  ok: boolean;
+  blocked?: boolean;
+  needs_clarification?: boolean;
+  questions?: string[];
+  reason?: string;
+}
+
 export interface StreamChatCallbacks {
+  onRequestId?: (data: { request_id: string }) => void;
   onSession?: (data: { session_id: number }) => void;
   onStatus?: (data: { step: string; message?: string }) => void;
   onToken?: (data: { text: string }) => void;
-  onArtifactSql?: (data: { sql: string }) => void;
-  onArtifactTable?: (data: { columns: string[]; rows: unknown[][] }) => void;
-  onArtifactChart?: (data: { chartSpec: Record<string, unknown> }) => void;
-  onComplete?: (data: { ok: boolean }) => void;
+  onArtifactSql?: (data: { tasks: SqlTask[] }) => void;
+  onArtifactTable?: (data: TableArtifact) => void;
+  onArtifactChart?: (data: ChartArtifact) => void;
+  onRetry?: (data: RetryData) => void;
+  onMetrics?: (data: MetricsData) => void;
+  onAudit?: (data: AuditData) => void;
+  onComplete?: (data: CompleteData) => void;
   onError?: (data: { message: string }) => void;
 }
 
@@ -242,6 +301,9 @@ function dispatchSSEEvent(
 ): void {
   const d = data as Record<string, unknown>;
   switch (event) {
+    case "request_id":
+      cb.onRequestId?.(d as { request_id: string });
+      break;
     case "session":
       cb.onSession?.(d as { session_id: number });
       break;
@@ -252,16 +314,25 @@ function dispatchSSEEvent(
       cb.onToken?.(d as { text: string });
       break;
     case "artifact_sql":
-      cb.onArtifactSql?.(d as { sql: string });
+      cb.onArtifactSql?.(d as { tasks: SqlTask[] });
       break;
     case "artifact_table":
-      cb.onArtifactTable?.(d as { columns: string[]; rows: unknown[][] });
+      cb.onArtifactTable?.(d as TableArtifact);
       break;
     case "artifact_chart":
-      cb.onArtifactChart?.(d as { chartSpec: Record<string, unknown> });
+      cb.onArtifactChart?.(d as ChartArtifact);
+      break;
+    case "retry":
+      cb.onRetry?.(d as RetryData);
+      break;
+    case "metrics":
+      cb.onMetrics?.(d as MetricsData);
+      break;
+    case "audit":
+      cb.onAudit?.(d as AuditData);
       break;
     case "complete":
-      cb.onComplete?.(d as { ok: boolean });
+      cb.onComplete?.(d as CompleteData);
       break;
     case "error":
       cb.onError?.(d as { message: string });

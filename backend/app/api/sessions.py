@@ -5,11 +5,13 @@ Endpoints:
     GET  /api/sessions               → list user sessions
     POST /api/sessions               → create empty session
     GET  /api/sessions/{id}/messages  → messages for a session
-    POST /api/chat                   → send a chat message (stub agent)
+    POST /api/chat                   → send a chat message (non-streaming, uses workflow)
 """
 
 from __future__ import annotations
 
+import time
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -19,11 +21,21 @@ from app.security.deps import require_auth
 from app.services.chat_history import (
     add_message,
     create_session,
+    get_recent_messages,
     get_session,
     list_messages,
     list_sessions,
     maybe_auto_title,
 )
+from app.services.audit import (
+    create_audit_start,
+    finalize_audit_success,
+    finalize_audit_error,
+)
+from app.agent.workflow import run_workflow
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
 
 router = APIRouter(tags=["chat"])
 
@@ -95,10 +107,11 @@ async def sessions_messages(
 @router.post("/chat", response_model=ChatResponse)
 async def chat(body: ChatRequest, user: dict[str, Any] = Depends(require_auth)):
     """
-    Accept a user message, store it, return a stub assistant response.
-    Creates a session automatically if ``session_id`` is not provided.
+    Accept a user message, run the 10-node workflow (non-streaming),
+    store results, and return the full message history.
     """
     user_id: int = user["id"]
+    request_id = str(uuid.uuid4())
 
     # Resolve or create session
     if body.session_id is not None:
@@ -115,19 +128,66 @@ async def chat(body: ChatRequest, user: dict[str, Any] = Depends(require_auth)):
 
     # Store user message
     await add_message(session_id, "user", body.message)
-
-    # Auto-title from first user message
     await maybe_auto_title(session_id)
 
-    # Stub assistant response (will be replaced by real agent later)
-    stub_answer = "Got it. (Agent coming next.)"
-    await add_message(session_id, "assistant", stub_answer)
+    # Load history for context
+    history_rows = await get_recent_messages(user_id, session_id, limit=6)
+    history = [{"role": h["role"], "content": h["content"]} for h in history_rows]
+
+    # Create audit entry
+    audit_id: int | None = None
+    try:
+        audit_id = await create_audit_start(
+            request_id=request_id,
+            user_id=user_id,
+            session_id=session_id,
+            mode="sync",
+        )
+    except Exception:
+        logger.warning("Failed to create audit entry", exc_info=True)
+
+    # No-op emitter for non-streaming mode
+    async def _noop_emit(event: str, data: dict) -> None:
+        pass
+
+    # Run the full workflow
+    t0 = time.perf_counter()
+    try:
+        state = await run_workflow(body.message, history, _noop_emit)
+    except Exception as exc:
+        if audit_id:
+            try:
+                await finalize_audit_error(audit_id, error_message=str(exc))
+            except Exception:
+                logger.warning("Audit finalize (error) failed", exc_info=True)
+        raise
+
+    total_ms = round((time.perf_counter() - t0) * 1000)
+
+    # Persist assistant response
+    sql_queries = "; ".join(t.sql for t in state.tasks if t.sql) or None
+    await add_message(session_id, "assistant", state.answer_text, sql_query=sql_queries)
+
+    # Finalize audit
+    if audit_id:
+        try:
+            await finalize_audit_success(
+                audit_id,
+                tasks_count=len(state.tasks),
+                retries_used=state.retries_used,
+                tables_used=state.tables_used,
+                metrics_used=state.metrics_used,
+                timings_ms={"total_ms": total_ms, "llm_ms": state.llm_ms, "db_ms": state.db_ms},
+                rows_returned=state.rows_returned,
+            )
+        except Exception:
+            logger.warning("Audit finalize (success) failed", exc_info=True)
 
     # Return full message history
     messages = await list_messages(user_id, session_id)
 
     return ChatResponse(
         session_id=session_id,
-        answer=stub_answer,
+        answer=state.answer_text,
         messages=messages,
     )

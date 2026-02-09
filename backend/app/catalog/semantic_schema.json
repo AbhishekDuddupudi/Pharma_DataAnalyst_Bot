@@ -1,0 +1,122 @@
+{
+  "tables": {
+    "dim_product": {
+      "description": "Product dimension – branded pharma products. One row per product.",
+      "columns": {
+        "product_id":       {"type": "integer",  "description": "Primary key, unique product identifier."},
+        "brand_name":       {"type": "varchar",  "description": "Marketed brand name of the drug (e.g. Cardivex)."},
+        "generic_name":     {"type": "varchar",  "description": "INN / generic compound name (e.g. amlodipine besylate)."},
+        "company_name":     {"type": "varchar",  "description": "Manufacturer / marketing company."},
+        "therapeutic_area": {"type": "varchar",  "description": "Therapeutic area: Cardiovascular, Oncology, Respiratory, or CNS."},
+        "dosage_form":      {"type": "varchar",  "description": "Dosage form: Tablet, Injection, Inhaler, Capsule."},
+        "launch_date":      {"type": "date",     "description": "Date the product was launched on market."},
+        "is_active":        {"type": "boolean",  "description": "Whether the product is currently marketed."}
+      }
+    },
+    "dim_territory": {
+      "description": "Territory dimension – geographic hierarchy: region → district → state. 40 rows.",
+      "columns": {
+        "territory_id": {"type": "integer",  "description": "Primary key."},
+        "region":       {"type": "varchar",  "description": "High-level region: Northeast, Southeast, Midwest, Southwest, West, Mid-Atlantic, Mountain, Pacific NW."},
+        "district":     {"type": "varchar",  "description": "Sub-region grouping (Metro / Suburban / Rural)."},
+        "state":        {"type": "varchar",  "description": "US state name."}
+      }
+    },
+    "dim_time": {
+      "description": "Calendar dimension – one row per date from 2023-01-01 to 2024-12-31. Pre-computed rollup columns.",
+      "columns": {
+        "date":         {"type": "date",     "description": "Calendar date (primary key)."},
+        "year":         {"type": "smallint", "description": "Calendar year (2023 or 2024)."},
+        "quarter":      {"type": "smallint", "description": "Quarter 1-4."},
+        "month":        {"type": "smallint", "description": "Month 1-12."},
+        "week":         {"type": "smallint", "description": "ISO week number 1-53."},
+        "day_of_week":  {"type": "smallint", "description": "Day of week 0=Sun … 6=Sat."},
+        "year_quarter": {"type": "varchar",  "description": "E.g. '2024-Q3'."},
+        "year_month":   {"type": "varchar",  "description": "E.g. '2024-07'."},
+        "is_month_end": {"type": "boolean",  "description": "True if this date is the last day of its month."}
+      }
+    },
+    "fact_sales": {
+      "description": "Weekly pharma sales fact table. Grain: one row per (date, product_id, territory_id). Date is always a Monday (week start).",
+      "columns": {
+        "id":            {"type": "bigint",     "description": "Surrogate primary key."},
+        "date":          {"type": "date",       "description": "Week-start date (Monday). FK → dim_time.date."},
+        "product_id":    {"type": "integer",    "description": "FK → dim_product.product_id."},
+        "territory_id":  {"type": "integer",    "description": "FK → dim_territory.territory_id."},
+        "net_sales_usd": {"type": "numeric",    "description": "Net revenue in USD for this product-territory-week."},
+        "units":         {"type": "integer",    "description": "Units sold."},
+        "trx":           {"type": "integer",    "description": "Total prescriptions dispensed."},
+        "nrx":           {"type": "integer",    "description": "New (first-time) prescriptions dispensed."}
+      }
+    }
+  },
+  "joins": [
+    {"from": "fact_sales.date",         "to": "dim_time.date",              "type": "inner"},
+    {"from": "fact_sales.product_id",   "to": "dim_product.product_id",    "type": "inner"},
+    {"from": "fact_sales.territory_id", "to": "dim_territory.territory_id","type": "inner"}
+  ],
+  "metrics": {
+    "net_sales_usd": {
+      "description": "Total net revenue in USD.",
+      "aggregation": "SUM(fact_sales.net_sales_usd)",
+      "table": "fact_sales"
+    },
+    "units": {
+      "description": "Total units sold.",
+      "aggregation": "SUM(fact_sales.units)",
+      "table": "fact_sales"
+    },
+    "trx": {
+      "description": "Total prescriptions (TRx) dispensed.",
+      "aggregation": "SUM(fact_sales.trx)",
+      "table": "fact_sales"
+    },
+    "nrx": {
+      "description": "New prescriptions (NRx) dispensed.",
+      "aggregation": "SUM(fact_sales.nrx)",
+      "table": "fact_sales"
+    },
+    "nrx_share": {
+      "description": "NRx as a percentage of TRx – indicates new patient acquisition.",
+      "aggregation": "ROUND(100.0 * SUM(fact_sales.nrx) / NULLIF(SUM(fact_sales.trx), 0), 2)",
+      "table": "fact_sales"
+    }
+  },
+  "known_entities": {
+    "products": [
+      "Cardivex", "Pressura", "Lipovant",
+      "Oncoshield", "Tumorex", "Cellguard",
+      "Breatheasy", "Aeroclar", "Pulmovex",
+      "NeuroCalm", "Cognimax", "Anxiolyze"
+    ],
+    "companies": [
+      "NovaCure Therapeutics", "BioGenix Pharma",
+      "MedVista Labs", "Zenith BioSciences"
+    ],
+    "therapeutic_areas": [
+      "Cardiovascular", "Oncology", "Respiratory", "CNS"
+    ],
+    "regions": [
+      "Northeast", "Southeast", "Midwest", "Southwest",
+      "West", "Mid-Atlantic", "Mountain", "Pacific NW"
+    ],
+    "states": [
+      "New York", "New Jersey", "Connecticut", "Massachusetts", "Pennsylvania",
+      "Florida", "Georgia", "North Carolina", "Virginia", "Tennessee",
+      "Illinois", "Ohio", "Michigan", "Indiana", "Wisconsin",
+      "Texas", "Arizona", "Nevada", "New Mexico", "Oklahoma",
+      "California", "Washington", "Oregon", "Colorado", "Utah",
+      "Maryland", "Delaware", "DC", "West Virginia", "Rhode Island",
+      "Montana", "Idaho", "Wyoming", "South Dakota", "North Dakota",
+      "Alaska", "Hawaii", "Nebraska", "Kansas", "Iowa"
+    ]
+  },
+  "data_notes": [
+    "Date range: 2023-01-02 to 2024-12-30 (weekly Mondays).",
+    "Cardivex has a supply disruption in Northeast during 2024-Q3 (~58% sales drop) with partial Q4 recovery.",
+    "Oncoshield shows steady ~3.5% quarterly growth.",
+    "Respiratory products peak in Q4/Q1 (flu season) and dip in summer.",
+    "Anxiolyze launched Mar 2023 with an S-curve ramp-up.",
+    "Lipovant is in slow decline (~15% over 2 years)."
+  ]
+}

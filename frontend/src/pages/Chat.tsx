@@ -4,19 +4,32 @@ import {
   getSessionMessages,
   streamChat,
 } from "../api/client";
-import type { Session, Message } from "../api/client";
+import type {
+  Session,
+  Message,
+  SqlTask,
+  TableArtifact,
+  ChartArtifact,
+  MetricsData,
+  RetryData,
+  CompleteData,
+} from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import Sidebar from "../components/Sidebar";
 
-/* ── Pipeline step labels (order matters) ─────────── */
+/* ── Pipeline step labels (10 nodes) ──────────────── */
 
 const STEP_LABELS: Record<string, string> = {
   preprocess_input: "Preprocess",
+  scope_policy_check: "Scope Check",
+  semantic_grounding: "Grounding",
   analysis_planner: "Plan",
   sql_generator: "Generate SQL",
   sql_validator: "Validate",
-  sql_executor: "Run Query",
-  response_synthesizer: "Write Answer",
+  sql_repair: "Repair",
+  sql_executor: "Execute",
+  viz_builder: "Visualise",
+  response_synthesizer: "Synthesise",
 };
 
 const STEP_KEYS = Object.keys(STEP_LABELS);
@@ -24,12 +37,14 @@ const STEP_KEYS = Object.keys(STEP_LABELS);
 /* ── Artifact types ───────────────────────────────── */
 
 interface Artifacts {
-  sql: string | null;
-  table: { columns: string[]; rows: unknown[][] } | null;
-  chart: Record<string, unknown> | null;
+  sqlTasks: SqlTask[];
+  tables: TableArtifact[];
+  chart: ChartArtifact | null;
 }
 
 type ArtifactTab = "answer" | "sql" | "table" | "chart";
+
+const EMPTY_ARTIFACTS: Artifacts = { sqlTasks: [], tables: [], chart: null };
 
 /* ── Component ────────────────────────────────────── */
 
@@ -47,19 +62,14 @@ export default function Chat() {
   const [streamingText, setStreamingText] = useState("");
   const [activeStep, setActiveStep] = useState<string | null>(null);
   const [completedSteps, setCompletedSteps] = useState<Set<string>>(new Set());
-  const [artifacts, setArtifacts] = useState<Artifacts>({
-    sql: null,
-    table: null,
-    chart: null,
-  });
+  const [artifacts, setArtifacts] = useState<Artifacts>(EMPTY_ARTIFACTS);
   const [activeTab, setActiveTab] = useState<ArtifactTab>("answer");
   const [showProgress, setShowProgress] = useState(false);
-  const [lastArtifacts, setLastArtifacts] = useState<Artifacts>({
-    sql: null,
-    table: null,
-    chart: null,
-  });
+  const [lastArtifacts, setLastArtifacts] = useState<Artifacts>(EMPTY_ARTIFACTS);
   const [showArtifactTabs, setShowArtifactTabs] = useState(false);
+  const [metrics, setMetrics] = useState<MetricsData | null>(null);
+  const [selectedTableIdx, setSelectedTableIdx] = useState(0);
+  const [retries, setRetries] = useState<RetryData[]>([]);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -104,7 +114,6 @@ export default function Chat() {
   /* ── handlers ───────────────────────────────────── */
 
   function handleSelectSession(id: number) {
-    // Cancel in-flight stream if any
     abortRef.current?.abort();
     resetStreamState();
     setActiveSessionId(id);
@@ -126,8 +135,11 @@ export default function Chat() {
     setActiveStep(null);
     setCompletedSteps(new Set());
     setShowProgress(false);
-    setArtifacts({ sql: null, table: null, chart: null });
+    setArtifacts(EMPTY_ARTIFACTS);
     setActiveTab("answer");
+    setMetrics(null);
+    setSelectedTableIdx(0);
+    setRetries([]);
   }
 
   async function handleSend(e: React.FormEvent) {
@@ -142,8 +154,11 @@ export default function Chat() {
     setCompletedSteps(new Set());
     setShowProgress(true);
     setShowArtifactTabs(false);
-    setArtifacts({ sql: null, table: null, chart: null });
+    setArtifacts(EMPTY_ARTIFACTS);
     setActiveTab("answer");
+    setMetrics(null);
+    setSelectedTableIdx(0);
+    setRetries([]);
 
     // Optimistic user bubble
     const optimistic: Message = {
@@ -158,11 +173,16 @@ export default function Chat() {
 
     let resolvedSessionId = activeSessionId;
     let prevStep: string | null = null;
-    const streamArtifacts: Artifacts = { sql: null, table: null, chart: null };
+    const streamArtifacts: Artifacts = { sqlTasks: [], tables: [], chart: null };
+    let streamMetrics: MetricsData | null = null;
 
     const controller = streamChat(
       { session_id: activeSessionId ?? undefined, message: text },
       {
+        onRequestId(_data) {
+          // Could display request_id in UI if needed
+        },
+
         onSession(data) {
           resolvedSessionId = data.session_id;
           if (activeSessionId === null) {
@@ -171,7 +191,6 @@ export default function Chat() {
         },
 
         onStatus(data) {
-          // Mark previous step as completed
           if (prevStep) {
             setCompletedSteps((prev) => new Set(prev).add(prevStep!));
           }
@@ -184,25 +203,33 @@ export default function Chat() {
         },
 
         onArtifactSql(data) {
-          streamArtifacts.sql = data.sql;
-          setArtifacts((prev) => ({ ...prev, sql: data.sql }));
+          streamArtifacts.sqlTasks = data.tasks;
+          setArtifacts((prev) => ({ ...prev, sqlTasks: data.tasks }));
         },
 
         onArtifactTable(data) {
-          streamArtifacts.table = { columns: data.columns, rows: data.rows };
+          streamArtifacts.tables = [...streamArtifacts.tables, data];
           setArtifacts((prev) => ({
             ...prev,
-            table: { columns: data.columns, rows: data.rows },
+            tables: [...prev.tables, data],
           }));
         },
 
         onArtifactChart(data) {
-          streamArtifacts.chart = data.chartSpec;
-          setArtifacts((prev) => ({ ...prev, chart: data.chartSpec }));
+          streamArtifacts.chart = data;
+          setArtifacts((prev) => ({ ...prev, chart: data }));
         },
 
-        async onComplete() {
-          // Mark last step done
+        onRetry(data) {
+          setRetries((prev) => [...prev, data]);
+        },
+
+        onMetrics(data) {
+          streamMetrics = data;
+          setMetrics(data);
+        },
+
+        async onComplete(_data: CompleteData) {
           if (prevStep) {
             setCompletedSteps((prev) => new Set(prev).add(prevStep!));
           }
@@ -210,8 +237,8 @@ export default function Chat() {
           setShowProgress(false);
           setLastArtifacts({ ...streamArtifacts });
           setShowArtifactTabs(true);
+          if (streamMetrics) setMetrics(streamMetrics);
 
-          // Reload persisted messages from server
           if (resolvedSessionId !== null) {
             await loadMessages(resolvedSessionId);
           }
@@ -225,7 +252,6 @@ export default function Chat() {
           setShowProgress(false);
           setStreamingText("");
           setSending(false);
-          // Remove optimistic message
           setMessages((prev) =>
             prev.filter((m) => m.id !== optimistic.id),
           );
@@ -270,20 +296,18 @@ export default function Chat() {
             </div>
           ) : (
             <div className="mx-auto max-w-2xl space-y-4">
-              {/* Persisted messages */}
               {messages.map((m) => (
                 <MessageBubble key={m.id} message={m} />
               ))}
 
-              {/* Progress panel (while streaming) */}
               {showProgress && (
                 <ProgressPanel
                   activeStep={activeStep}
                   completedSteps={completedSteps}
+                  retries={retries}
                 />
               )}
 
-              {/* Streaming assistant bubble */}
               {streamingText && (
                 <div className="flex justify-start">
                   <div className="max-w-[80%] rounded-lg bg-surface-overlay px-4 py-2.5 text-sm leading-relaxed text-neutral-200">
@@ -293,12 +317,14 @@ export default function Chat() {
                 </div>
               )}
 
-              {/* Artifact tabs (after completion, for the last assistant message) */}
               {showArtifactTabs && !sending && (
                 <ArtifactPanel
                   artifacts={lastArtifacts}
                   activeTab={activeTab}
                   onTabChange={setActiveTab}
+                  metrics={metrics}
+                  selectedTableIdx={selectedTableIdx}
+                  onSelectTable={setSelectedTableIdx}
                 />
               )}
 
@@ -360,9 +386,11 @@ function MessageBubble({ message: m }: { message: Message }) {
 function ProgressPanel({
   activeStep,
   completedSteps,
+  retries,
 }: {
   activeStep: string | null;
   completedSteps: Set<string>;
+  retries: RetryData[];
 }) {
   return (
     <div className="flex justify-start">
@@ -395,6 +423,17 @@ function ProgressPanel({
             );
           })}
         </div>
+
+        {/* Retry events */}
+        {retries.length > 0 && (
+          <div className="mt-2 space-y-1">
+            {retries.map((r, i) => (
+              <p key={i} className="text-[10px] text-amber-400">
+                ⟳ Retry {r.attempt}/{r.max} ({r.type}) — {r.reason}
+              </p>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -404,17 +443,25 @@ function ArtifactPanel({
   artifacts,
   activeTab,
   onTabChange,
+  metrics,
+  selectedTableIdx,
+  onSelectTable,
 }: {
   artifacts: Artifacts;
   activeTab: ArtifactTab;
   onTabChange: (tab: ArtifactTab) => void;
+  metrics: MetricsData | null;
+  selectedTableIdx: number;
+  onSelectTable: (idx: number) => void;
 }) {
   const tabs: { key: ArtifactTab; label: string }[] = [
     { key: "answer", label: "Answer" },
-    { key: "sql", label: "SQL" },
-    { key: "table", label: "Table" },
+    { key: "sql", label: `SQL${artifacts.sqlTasks.length > 1 ? ` (${artifacts.sqlTasks.length})` : ""}` },
+    { key: "table", label: `Table${artifacts.tables.length > 1 ? ` (${artifacts.tables.length})` : ""}` },
     { key: "chart", label: "Chart" },
   ];
+
+  const currentTable = artifacts.tables[selectedTableIdx];
 
   return (
     <div className="rounded-lg border border-border bg-surface-raised">
@@ -444,61 +491,140 @@ function ArtifactPanel({
         )}
 
         {activeTab === "sql" && (
-          <div>
-            {artifacts.sql ? (
-              <pre className="overflow-x-auto rounded bg-surface p-3 font-mono text-xs text-neutral-300">
-                {artifacts.sql}
-              </pre>
+          <div className="space-y-3">
+            {artifacts.sqlTasks.length > 0 ? (
+              artifacts.sqlTasks.map((task, i) => (
+                <div key={i}>
+                  <p className="mb-1 text-xs font-semibold text-neutral-300">
+                    {task.title}
+                  </p>
+                  <pre className="overflow-x-auto rounded bg-surface p-3 font-mono text-xs text-neutral-300">
+                    {task.sql}
+                  </pre>
+                  {task.error && (
+                    <p className="mt-1 text-xs text-red-400">⚠ {task.error}</p>
+                  )}
+                </div>
+              ))
             ) : (
-              <p className="text-xs text-neutral-500">Not available yet.</p>
+              <p className="text-xs text-neutral-500">No SQL generated.</p>
             )}
           </div>
         )}
 
         {activeTab === "table" && (
           <div>
-            {artifacts.table ? (
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-xs">
-                  <thead>
-                    <tr className="border-b border-border">
-                      {artifacts.table.columns.map((col) => (
-                        <th
-                          key={col}
-                          className="px-3 py-2 font-semibold text-neutral-300"
-                        >
-                          {col}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {artifacts.table.rows.map((row, ri) => (
-                      <tr key={ri} className="border-b border-border/50">
-                        {row.map((cell, ci) => (
-                          <td key={ci} className="px-3 py-1.5 text-neutral-400">
-                            {String(cell)}
-                          </td>
+            {artifacts.tables.length > 1 && (
+              <div className="mb-3 flex gap-2">
+                {artifacts.tables.map((t, i) => (
+                  <button
+                    key={i}
+                    onClick={() => onSelectTable(i)}
+                    className={`rounded px-2 py-1 text-xs font-medium transition-colors ${
+                      i === selectedTableIdx
+                        ? "bg-accent/20 text-accent-hover"
+                        : "bg-surface-overlay text-neutral-500 hover:text-neutral-300"
+                    }`}
+                  >
+                    {t.task_title}
+                  </button>
+                ))}
+              </div>
+            )}
+            {currentTable ? (
+              <div>
+                {artifacts.tables.length === 1 && (
+                  <p className="mb-2 text-xs font-semibold text-neutral-300">
+                    {currentTable.task_title}
+                  </p>
+                )}
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className="border-b border-border">
+                        {currentTable.columns.map((col) => (
+                          <th
+                            key={col}
+                            className="px-3 py-2 font-semibold text-neutral-300"
+                          >
+                            {col}
+                          </th>
                         ))}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {currentTable.rows.map((row, ri) => (
+                        <tr key={ri} className="border-b border-border/50">
+                          {row.map((cell, ci) => (
+                            <td
+                              key={ci}
+                              className="px-3 py-1.5 text-neutral-400"
+                            >
+                              {String(cell)}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <p className="mt-2 text-xs text-neutral-500">
+                  {currentTable.row_count} row{currentTable.row_count !== 1 ? "s" : ""}
+                  {currentTable.truncated ? " (truncated)" : ""}
+                </p>
               </div>
             ) : (
-              <p className="text-xs text-neutral-500">Not available yet.</p>
+              <p className="text-xs text-neutral-500">No table data.</p>
             )}
           </div>
         )}
 
         {activeTab === "chart" && (
-          <p className="text-xs text-neutral-500">
-            {artifacts.chart
-              ? "Chart visualization available in P6."
-              : "Not available yet."}
-          </p>
+          <div>
+            {artifacts.chart?.available ? (
+              <div className="space-y-2">
+                <p className="text-xs text-neutral-300">
+                  <span className="font-semibold">Chart type:</span>{" "}
+                  {artifacts.chart.chart_type}
+                </p>
+                {artifacts.chart.title && (
+                  <p className="text-xs text-neutral-300">
+                    <span className="font-semibold">Title:</span>{" "}
+                    {artifacts.chart.title}
+                  </p>
+                )}
+                <p className="text-xs text-neutral-300">
+                  <span className="font-semibold">X:</span>{" "}
+                  {artifacts.chart.x_column} |{" "}
+                  <span className="font-semibold">Y:</span>{" "}
+                  {artifacts.chart.y_column}
+                </p>
+                <p className="mt-2 text-xs text-neutral-500 italic">
+                  Chart rendering coming soon — spec is ready.
+                </p>
+              </div>
+            ) : (
+              <p className="text-xs text-neutral-500">
+                No chart available for this query.
+              </p>
+            )}
+          </div>
         )}
       </div>
+
+      {/* Metrics footer */}
+      {metrics && (
+        <div className="flex gap-4 border-t border-border px-4 py-2 text-[10px] text-neutral-500">
+          <span>Total: {metrics.total_ms}ms</span>
+          <span>LLM: {metrics.llm_ms}ms</span>
+          <span>DB: {metrics.db_ms}ms</span>
+          <span>Rows: {metrics.rows_returned}</span>
+          <span>Tokens: {metrics.tokens_streamed}</span>
+          {metrics.retries_used > 0 && (
+            <span className="text-amber-500">Retries: {metrics.retries_used}</span>
+          )}
+        </div>
+      )}
     </div>
   );
 }

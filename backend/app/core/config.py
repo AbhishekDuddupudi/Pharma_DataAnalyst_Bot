@@ -27,6 +27,12 @@ class Settings(BaseSettings):
 
     # ── OpenAI / LLM ─────────────────────────────────────────────
     OPENAI_API_KEY: str = ""
+    OPENAI_MODEL: str = "gpt-4o-mini"
+
+    # ── Agent / Streaming ─────────────────────────────────────────
+    STREAM_DEMO_DELAY_MS: int = 0
+    SQL_MAX_RETRIES: int = 2
+    SQL_MAX_ROWS: int = 100
 
     # ── Helpers ───────────────────────────────────────────────────
     @property
