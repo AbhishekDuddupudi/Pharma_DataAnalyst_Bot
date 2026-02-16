@@ -230,6 +230,57 @@ A demo account is seeded automatically by `db/03_auth.sql`:
 
 ---
 
+## Output Contract (P6.5)
+
+### Structured Answer JSON
+
+The response synthesizer (Node 10) now returns a structured JSON object instead of raw markdown.
+Every assistant message stores this structure in `artifacts_json.answer_json`:
+
+```json
+{
+  "title": "Cardivex Northeast Q3 2024 Sales Summary",
+  "executive_summary": "Revenue declined 12% QoQ to $4.2M driven by lower TRx volume.",
+  "key_findings": [
+    "Total revenue was $4.2M, down from $4.8M in Q2 2024",
+    "TRx volume dropped 8% while NRx remained flat"
+  ],
+  "assumptions": [
+    "Comparison is Q3 vs Q2 of the same year"
+  ],
+  "next_questions": [
+    "How does this compare to the national average?",
+    "Which states drove the decline?"
+  ]
+}
+```
+
+**Rules**: No SQL, code blocks, or markdown tokens (`**`, `###`, `` ``` ``) ever appear in the answer text. SQL is only available in the SQL artifact tab.
+
+### Artifact Persistence
+
+Every assistant message persists an `artifacts_json` JSONB column containing:
+- `sql_tasks` — array of `{title, sql, error}` for each generated query
+- `tables` — array of `{task_title, columns, rows, row_count, truncated}`
+- `chart` — chart spec or `{available: false}`
+- `answer_json` — the structured answer above
+
+Clicking any historical assistant message loads its stored artifacts into the detail panel.
+Legacy messages (before P6.5) show "Not available (older message)" in artifact tabs.
+
+### Clarify Behaviour
+
+When the user asks an underspecified analytical question (missing 2+ of: product/brand, region/territory, timeframe, metric), the bot asks targeted clarification questions instead of guessing:
+
+- **Trigger**: "insights" mode + 2+ missing dimensions
+- **Behaviour**: No SQL is generated. Clarification questions are streamed as the answer.
+- **Artifact tabs**: Show "Not available (clarification)"
+- **Example**: "Why did sales decline?" → asks which product, region, timeframe, and metric
+
+Fully specified questions proceed normally through the full 10-node pipeline.
+
+---
+
 ## License
 
 Private — all rights reserved.

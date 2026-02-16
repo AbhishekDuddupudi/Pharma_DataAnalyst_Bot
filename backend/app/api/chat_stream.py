@@ -216,11 +216,38 @@ async def _generate_stream(
 
             # ── Persist assistant message ─────────────────────
             sql_queries = "; ".join(t.sql for t in workflow_state.tasks if t.sql)
+
+            # Build metadata for artifact restoration on history load
+            metadata: dict[str, Any] = {}
+            if workflow_state.tasks:
+                metadata["sql_tasks"] = [
+                    {"title": t.title, "sql": t.sql}
+                    for t in workflow_state.tasks if t.sql
+                ]
+            if workflow_state.tasks:
+                tables = []
+                for t in workflow_state.tasks:
+                    if t.result and t.result.rows:
+                        tables.append({
+                            "title": t.title,
+                            "columns": t.result.columns,
+                            "rows": t.result.rows[:50],  # cap for storage
+                        })
+                if tables:
+                    metadata["tables"] = tables
+            if workflow_state.chart_spec:
+                metadata["chart"] = workflow_state.chart_spec
+            if workflow_state.assumptions:
+                metadata["assumptions"] = workflow_state.assumptions
+            if workflow_state.follow_ups:
+                metadata["follow_ups"] = workflow_state.follow_ups
+
             await add_message(
                 session_id,
                 "assistant",
                 workflow_state.answer_text,
                 sql_query=sql_queries or None,
+                metadata=metadata or None,
             )
 
             # ── Finalize audit ────────────────────────────────

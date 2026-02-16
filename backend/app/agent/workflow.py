@@ -145,6 +145,8 @@ class WorkflowState:
     clarification_questions: list[str] = field(default_factory=list)
     tables_used: list[str] = field(default_factory=list)
     metrics_used: list[str] = field(default_factory=list)
+    assumptions: list[str] = field(default_factory=list)
+    follow_ups: list[str] = field(default_factory=list)
 
 
 # ── Schema loader ────────────────────────────────────────────────
@@ -247,6 +249,41 @@ async def _scope_policy_check(state: WorkflowState, emit: Emitter) -> None:
     # ── Step C: analytics domain match → allow ───────────────
     domain_overlap = words & _ANALYTICS_DOMAINS
     if len(domain_overlap) >= 2:
+        # ── Step C2: vague insight detection ──────────────────
+        # If it's an insight-mode question, check for specificity
+        if state.mode == "insights":
+            schema = _load_schema()
+            known = schema.get("known_entities", {})
+            known_products = {p.lower() for p in (known.get("products") or [])}
+            known_areas = {a.lower() for a in (known.get("therapeutic_areas") or [])}
+            known_regions = {r.lower() for r in (known.get("regions") or [])}
+            time_words = {"2023", "2024", "2025", "q1", "q2", "q3", "q4",
+                          "january", "february", "march", "april", "may", "june",
+                          "july", "august", "september", "october", "november", "december",
+                          "last year", "this year", "ytd", "year"}
+
+            has_product = bool(words & known_products) or bool(words & known_areas)
+            has_region = bool(words & known_regions)
+            has_time = bool(words & time_words)
+
+            missing: list[str] = []
+            if not has_product:
+                missing.append("Which product or therapeutic area?")
+            if not has_region:
+                missing.append("Which region or territory?")
+            if not has_time:
+                missing.append("What time period (e.g. Q1 2024, last year)?")
+
+            if len(missing) >= 2:
+                state.needs_clarification = True
+                state.clarification_questions = missing
+                await emit("status", {
+                    "step": "scope_policy_check",
+                    "message": "Need clarification — question is too vague",
+                })
+                logger.info("Scope CLARIFICATION needed: missing=%s", missing)
+                return
+
         await emit("status", {
             "step": "scope_policy_check",
             "message": "Allowed (rules) — analytics question detected",
@@ -579,7 +616,7 @@ async def _viz_builder(state: WorkflowState, emit: Emitter) -> None:
 
 
 async def _response_synthesizer(state: WorkflowState, emit: Emitter) -> None:
-    """Node 10: stream a natural-language summary of results."""
+    """Node 10: produce a structured answer with assumptions + follow-ups."""
     await emit("status", {"step": "response_synthesizer", "message": "Writing answer…"})
 
     # Build context from all task results
@@ -599,23 +636,53 @@ async def _response_synthesizer(state: WorkflowState, emit: Emitter) -> None:
     results_text = "\n\n".join(results_text_parts) if results_text_parts else "No data was returned."
 
     system = (
-        "You are a pharmaceutical data analyst presenting query results. "
-        "Write a clear, concise summary of the findings. "
-        "Use bullet points or numbers for multiple findings. "
-        "Mention specific values and percentages from the data. "
-        "Keep it under 250 words. "
-        "If there were errors, explain what happened."
+        "You are a pharmaceutical data analyst presenting query results.\n"
+        "Return a JSON object with exactly these keys:\n"
+        "{\n"
+        '  "answer": "...",\n'
+        '  "assumptions": ["...", "..."],\n'
+        '  "follow_ups": ["...", "..."]\n'
+        "}\n\n"
+        "Rules for the 'answer' field:\n"
+        "- Write a clear, professional summary of the findings.\n"
+        "- You may use markdown headings (## or ###), bold (**text**), and bullet lists.\n"
+        "- Mention specific values, percentages, and trends from the data.\n"
+        "- NEVER include SQL code, query text, or table names in the answer.\n"
+        "- Keep it under 250 words.\n"
+        "- If there were errors, explain what happened.\n\n"
+        "Rules for 'assumptions':\n"
+        "- List 1-3 key assumptions made (e.g. time range, metric used, filters applied).\n"
+        "- Each assumption should be a short sentence.\n\n"
+        "Rules for 'follow_ups':\n"
+        "- Suggest 2-3 natural follow-up questions the user might ask next.\n"
+        "- Keep each under 12 words.\n"
+        "- Make them specific and actionable."
     )
 
     user_prompt = f"User question: {state.preprocessed}\n\nQuery results:\n{results_text}"
 
-    full_parts: list[str] = []
-    async for token in stream_llm_tokens(system, user_prompt):
-        full_parts.append(token)
-        state.tokens_streamed += 1
-        await emit("token", {"text": token})
+    resp = await call_llm_json(system, user_prompt)
+    state.llm_ms += resp["llm_ms"]
+    result = resp["result"]
 
-    state.answer_text = "".join(full_parts)
+    answer = result.get("answer", "I was unable to generate a summary.")
+    state.assumptions = result.get("assumptions", [])
+    state.follow_ups = result.get("follow_ups", [])
+
+    # Emit the structured metadata before streaming the answer
+    await emit("answer_meta", {
+        "assumptions": state.assumptions,
+        "follow_ups": state.follow_ups,
+    })
+
+    # Stream the answer text token-by-token for the live typing effect
+    words = answer.split(" ")
+    for i, word in enumerate(words):
+        token = word if i == len(words) - 1 else word + " "
+        await emit("token", {"text": token})
+        state.tokens_streamed += 1
+
+    state.answer_text = answer
 
 
 # ── Main orchestrator ────────────────────────────────────────────

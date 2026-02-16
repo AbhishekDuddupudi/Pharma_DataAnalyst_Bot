@@ -57,6 +57,7 @@ class MessageOut(BaseModel):
     role: str
     content: str
     sql_query: str | None = None
+    metadata: dict | None = None
     created_at: str
 
 
@@ -166,7 +167,33 @@ async def chat(body: ChatRequest, user: dict[str, Any] = Depends(require_auth)):
 
     # Persist assistant response
     sql_queries = "; ".join(t.sql for t in state.tasks if t.sql) or None
-    await add_message(session_id, "assistant", state.answer_text, sql_query=sql_queries)
+
+    # Build metadata for artifact restoration on history load
+    metadata: dict[str, Any] = {}
+    if state.tasks:
+        metadata["sql_tasks"] = [
+            {"title": t.title, "sql": t.sql}
+            for t in state.tasks if t.sql
+        ]
+        tables = []
+        for t in state.tasks:
+            if t.result and t.result.rows:
+                tables.append({
+                    "title": t.title,
+                    "columns": t.result.columns,
+                    "rows": t.result.rows[:50],
+                })
+        if tables:
+            metadata["tables"] = tables
+    if state.chart_spec:
+        metadata["chart"] = state.chart_spec
+    if state.assumptions:
+        metadata["assumptions"] = state.assumptions
+    if state.follow_ups:
+        metadata["follow_ups"] = state.follow_ups
+
+    await add_message(session_id, "assistant", state.answer_text,
+                      sql_query=sql_queries, metadata=metadata or None)
 
     # Finalize audit
     if audit_id:

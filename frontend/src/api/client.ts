@@ -88,12 +88,21 @@ export interface Session {
   updated_at: string;
 }
 
+export interface AssistantMetadata {
+  sql_tasks?: { title: string; sql: string }[];
+  tables?: { title: string; columns: string[]; rows: unknown[][] }[];
+  chart?: ChartArtifact | null;
+  assumptions?: string[];
+  follow_ups?: string[];
+}
+
 export interface Message {
   id: number;
   session_id: number;
   role: "user" | "assistant";
   content: string;
   sql_query: string | null;
+  metadata: AssistantMetadata | null;
   created_at: string;
 }
 
@@ -190,6 +199,7 @@ export interface StreamChatCallbacks {
   onArtifactSql?: (data: { tasks: SqlTask[] }) => void;
   onArtifactTable?: (data: TableArtifact) => void;
   onArtifactChart?: (data: ChartArtifact) => void;
+  onAnswerMeta?: (data: { assumptions: string[]; follow_ups: string[] }) => void;
   onRetry?: (data: RetryData) => void;
   onMetrics?: (data: MetricsData) => void;
   onAudit?: (data: AuditData) => void;
@@ -321,6 +331,9 @@ function dispatchSSEEvent(
       break;
     case "artifact_chart":
       cb.onArtifactChart?.(d as ChartArtifact);
+      break;
+    case "answer_meta":
+      cb.onAnswerMeta?.(d as { assumptions: string[]; follow_ups: string[] });
       break;
     case "retry":
       cb.onRetry?.(d as RetryData);

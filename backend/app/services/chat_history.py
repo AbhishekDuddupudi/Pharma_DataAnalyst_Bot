@@ -90,7 +90,7 @@ async def list_messages(user_id: int, session_id: int) -> list[dict[str, Any]]:
     conn = await _get_conn()
     try:
         rows = await conn.fetch(
-            "SELECT id, session_id, role, content, sql_query, created_at "
+            "SELECT id, session_id, role, content, sql_query, metadata, created_at "
             "FROM chat_message "
             "WHERE session_id = $1 "
             "ORDER BY created_at ASC",
@@ -106,18 +106,22 @@ async def add_message(
     role: str,
     content: str,
     sql_query: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Insert a message and touch the session's updated_at."""
+    import json as _json
     conn = await _get_conn()
     try:
+        meta_json = _json.dumps(metadata) if metadata else None
         row = await conn.fetchrow(
-            "INSERT INTO chat_message (session_id, role, content, sql_query) "
-            "VALUES ($1, $2, $3, $4) "
-            "RETURNING id, session_id, role, content, sql_query, created_at",
+            "INSERT INTO chat_message (session_id, role, content, sql_query, metadata) "
+            "VALUES ($1, $2, $3, $4, $5::jsonb) "
+            "RETURNING id, session_id, role, content, sql_query, metadata, created_at",
             session_id,
             role,
             content,
             sql_query,
+            meta_json,
         )
         # Bump session updated_at
         await conn.execute(
@@ -145,7 +149,7 @@ async def get_recent_messages(
     conn = await _get_conn()
     try:
         rows = await conn.fetch(
-            "SELECT id, session_id, role, content, sql_query, created_at "
+            "SELECT id, session_id, role, content, sql_query, metadata, created_at "
             "FROM chat_message "
             "WHERE session_id = $1 "
             "ORDER BY created_at DESC "
@@ -220,7 +224,15 @@ def _session_to_dict(row: asyncpg.Record) -> dict[str, Any]:
 
 
 def _message_to_dict(row: asyncpg.Record) -> dict[str, Any]:
+    import json as _json
     d = dict(row)
     if isinstance(d.get("created_at"), datetime):
         d["created_at"] = d["created_at"].isoformat()
+    # Parse metadata JSONB if present (asyncpg returns str or None)
+    meta = d.get("metadata")
+    if meta is not None and isinstance(meta, str):
+        try:
+            d["metadata"] = _json.loads(meta)
+        except Exception:
+            d["metadata"] = None
     return d
