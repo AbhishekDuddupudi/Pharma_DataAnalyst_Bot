@@ -281,6 +281,45 @@ Fully specified questions proceed normally through the full 10-node pipeline.
 
 ---
 
+## Observability
+
+The bot integrates **Langfuse** for distributed tracing and observability. Every request creates one trace with spans for each of the 10 workflow nodes, plus sub-spans for per-task SQL generation and execution.
+
+### Setup
+
+1. Create a free account at [https://cloud.langfuse.com](https://cloud.langfuse.com)
+2. Generate API keys from your project settings
+3. Add to your `.env`:
+
+```bash
+LANGFUSE_ENABLED=true
+LANGFUSE_PUBLIC_KEY=pk-lf-YOUR_KEY_HERE
+LANGFUSE_SECRET_KEY=sk-lf-YOUR_KEY_HERE
+LANGFUSE_HOST=https://cloud.langfuse.com
+```
+
+4. Rebuild and restart: `docker compose up -d --build`
+
+### What Gets Traced
+
+- **Request metadata**: User ID, session ID, mode (stream/sync)
+- **10 workflow nodes**: Preprocess, scope check, grounding, planner, SQL gen, validator, repair, executor, viz, synthesizer
+- **LLM calls**: Model name, tokens in/out, latency per call
+- **SQL sub-spans**: Per-task generation and execution with timings
+- **Errors and retries**: Logged as span events with error messages
+
+### Viewing Traces
+
+After each query, the frontend displays a "View Trace →" link in the metrics footer (bottom of assistant message). Click it to open the trace in Langfuse's cloud UI.
+
+The `trace_id` is also stored in the `audit_log` table for cross-referencing.
+
+### Disabling Tracing
+
+Set `LANGFUSE_ENABLED=false` in `.env` and restart. The app will work normally without sending any traces.
+
+---
+
 ## License
 
 Private — all rights reserved.

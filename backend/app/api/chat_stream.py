@@ -40,6 +40,12 @@ from app.services.audit import (
     finalize_audit_error,
 )
 from app.agent.workflow import run_workflow
+from app.services.memory import (
+    get_memory_bundle,
+    update_session_summary,
+    update_context_json,
+    update_last_sql_intent,
+)
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -113,6 +119,9 @@ async def _generate_stream(
         history_rows = await get_recent_messages(user_id, session_id, limit=6)
         history = [{"role": h["role"], "content": h["content"]} for h in history_rows]
 
+        # ── Load memory bundle (4-layer) ──────────────────────
+        memory = await get_memory_bundle(user_id, session_id)
+
         # ── Create audit log entry ────────────────────────────
         audit_id: int | None = None
         try:
@@ -135,7 +144,9 @@ async def _generate_stream(
         async def _run_workflow():
             nonlocal workflow_state, workflow_error
             try:
-                workflow_state = await run_workflow(body.message, history, emit)
+                workflow_state = await run_workflow(
+                    body.message, history, emit, memory=memory,
+                )
             except Exception as exc:
                 workflow_error = str(exc)
                 logger.exception("Workflow error for user %s", user_id)
@@ -249,6 +260,42 @@ async def _generate_stream(
                 sql_query=sql_queries or None,
                 metadata=metadata or None,
             )
+
+            # ── Update memory bundle ──────────────────────────
+            if not workflow_state.blocked and not workflow_state.rejected:
+                try:
+                    # D) SQL intent – anchor for follow-ups
+                    if workflow_state.tasks:
+                        primary = workflow_state.tasks[0]
+                        intent = {
+                            "metric": (workflow_state.grounding_parsed.get("metrics") or [""])[0],
+                            "dimensions": workflow_state.grounding_parsed.get("columns", []),
+                            "filters": workflow_state.grounding_parsed.get("filters", []),
+                            "time_window": workflow_state.grounding_parsed.get("time_range", ""),
+                            "tables_used": workflow_state.tables_used,
+                            "last_sql_tasks": [
+                                {"task_id": f"t{i}", "purpose": t.title, "sql": t.sql}
+                                for i, t in enumerate(workflow_state.tasks) if t.sql
+                            ],
+                            "result_stats": {
+                                "rows": workflow_state.rows_returned,
+                            },
+                        }
+                        await update_last_sql_intent(user_id, session_id, intent)
+
+                    # C) Context JSON – structured state
+                    ctx_patch = {
+                        "metric": (workflow_state.grounding_parsed.get("metrics") or [None])[0],
+                        "tables": workflow_state.tables_used,
+                        "filters": workflow_state.grounding_parsed.get("filters", []),
+                        "time_window": workflow_state.grounding_parsed.get("time_range"),
+                    }
+                    await update_context_json(user_id, session_id, ctx_patch)
+
+                    # B) Session summary (cheap LLM call)
+                    await update_session_summary(user_id, session_id)
+                except Exception:
+                    logger.warning("Memory update failed", exc_info=True)
 
             # ── Finalize audit ────────────────────────────────
             if audit_id:

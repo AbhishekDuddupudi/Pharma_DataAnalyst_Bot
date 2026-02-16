@@ -33,6 +33,12 @@ from app.services.audit import (
     finalize_audit_error,
 )
 from app.agent.workflow import run_workflow
+from app.services.memory import (
+    get_memory_bundle,
+    update_session_summary,
+    update_context_json,
+    update_last_sql_intent,
+)
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -135,6 +141,9 @@ async def chat(body: ChatRequest, user: dict[str, Any] = Depends(require_auth)):
     history_rows = await get_recent_messages(user_id, session_id, limit=6)
     history = [{"role": h["role"], "content": h["content"]} for h in history_rows]
 
+    # Load memory bundle (4-layer)
+    memory = await get_memory_bundle(user_id, session_id)
+
     # Create audit entry
     audit_id: int | None = None
     try:
@@ -154,7 +163,7 @@ async def chat(body: ChatRequest, user: dict[str, Any] = Depends(require_auth)):
     # Run the full workflow
     t0 = time.perf_counter()
     try:
-        state = await run_workflow(body.message, history, _noop_emit)
+        state = await run_workflow(body.message, history, _noop_emit, memory=memory)
     except Exception as exc:
         if audit_id:
             try:
@@ -194,6 +203,36 @@ async def chat(body: ChatRequest, user: dict[str, Any] = Depends(require_auth)):
 
     await add_message(session_id, "assistant", state.answer_text,
                       sql_query=sql_queries, metadata=metadata or None)
+
+    # Update memory bundle
+    if not state.blocked and not state.rejected:
+        try:
+            if state.tasks:
+                primary = state.tasks[0]
+                intent = {
+                    "metric": (state.grounding_parsed.get("metrics") or [""])[0],
+                    "dimensions": state.grounding_parsed.get("columns", []),
+                    "filters": state.grounding_parsed.get("filters", []),
+                    "time_window": state.grounding_parsed.get("time_range", ""),
+                    "tables_used": state.tables_used,
+                    "last_sql_tasks": [
+                        {"task_id": f"t{i}", "purpose": t.title, "sql": t.sql}
+                        for i, t in enumerate(state.tasks) if t.sql
+                    ],
+                    "result_stats": {"rows": state.rows_returned},
+                }
+                await update_last_sql_intent(user_id, session_id, intent)
+
+            ctx_patch = {
+                "metric": (state.grounding_parsed.get("metrics") or [None])[0],
+                "tables": state.tables_used,
+                "filters": state.grounding_parsed.get("filters", []),
+                "time_window": state.grounding_parsed.get("time_range"),
+            }
+            await update_context_json(user_id, session_id, ctx_patch)
+            await update_session_summary(user_id, session_id)
+        except Exception:
+            logger.warning("Memory update failed", exc_info=True)
 
     # Finalize audit
     if audit_id:
