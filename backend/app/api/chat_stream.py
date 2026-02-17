@@ -39,6 +39,12 @@ from app.services.audit import (
     finalize_audit_success,
     finalize_audit_error,
 )
+from app.services.memory import (
+    get_memory_bundle,
+    update_context_json,
+    update_last_sql_intent,
+    update_session_summary,
+)
 from app.agent.workflow import run_workflow
 from app.core.logging import get_logger
 
@@ -113,6 +119,13 @@ async def _generate_stream(
         history_rows = await get_recent_messages(user_id, session_id, limit=6)
         history = [{"role": h["role"], "content": h["content"]} for h in history_rows]
 
+        # ── Load memory bundle ────────────────────────────────
+        memory_bundle: dict = {}
+        try:
+            memory_bundle = await get_memory_bundle(user_id, session_id)
+        except Exception:
+            logger.warning("Failed to load memory bundle", exc_info=True)
+
         # ── Create audit log entry ────────────────────────────
         audit_id: int | None = None
         try:
@@ -135,7 +148,7 @@ async def _generate_stream(
         async def _run_workflow():
             nonlocal workflow_state, workflow_error
             try:
-                workflow_state = await run_workflow(body.message, history, emit)
+                workflow_state = await run_workflow(body.message, history, emit, memory_bundle=memory_bundle)
             except Exception as exc:
                 workflow_error = str(exc)
                 logger.exception("Workflow error for user %s", user_id)
@@ -255,6 +268,60 @@ async def _generate_stream(
                 followups=workflow_state.follow_ups or None,
                 metrics_json=metrics_data,
             )
+
+            # ── Persist memory (only on successful, non-blocked runs) ──
+            if not workflow_state.blocked and not workflow_state.rejected:
+                try:
+                    # 1. SQL intent
+                    grounding = workflow_state.grounding_parsed or {}
+                    intent_payload: dict[str, Any] = {
+                        "metric": grounding.get("metrics", [None])[0] if grounding.get("metrics") else None,
+                        "dimensions": grounding.get("columns", []),
+                        "filters": grounding.get("filters", []),
+                        "time_window": grounding.get("time_range", ""),
+                        "tables_used": workflow_state.tables_used,
+                        "last_sql_tasks": [
+                            {"title": t.title, "sql": t.sql[:500]}
+                            for t in workflow_state.tasks if t.sql
+                        ],
+                        "result_stats": {
+                            "rows": workflow_state.rows_returned,
+                        },
+                    }
+                    await update_last_sql_intent(user_id, session_id, intent_payload)
+
+                    # 2. Context patch
+                    ctx_patch: dict[str, Any] = {}
+                    if grounding.get("metrics"):
+                        ctx_patch["metric"] = grounding["metrics"][0]
+                    if grounding.get("columns"):
+                        ctx_patch["dimensions"] = grounding["columns"]
+                    if grounding.get("filters"):
+                        ctx_patch["filters"] = grounding["filters"]
+                    if grounding.get("time_range"):
+                        ctx_patch["time_window"] = grounding["time_range"]
+                    # Extract entities
+                    entities: dict[str, str] = {}
+                    schema_ents = grounding.get("tables", [])
+                    if "dim_product" in schema_ents or "dim_product" in workflow_state.tables_used:
+                        entities["product"] = "referenced"
+                    if "dim_territory" in schema_ents or "dim_territory" in workflow_state.tables_used:
+                        entities["region"] = "referenced"
+                    if entities:
+                        ctx_patch["last_entities"] = entities
+                    if ctx_patch:
+                        await update_context_json(user_id, session_id, ctx_patch)
+
+                    # 3. Session summary (async, non-blocking)
+                    result_facts = {
+                        "tasks_count": len(workflow_state.tasks),
+                        "tables_used": workflow_state.tables_used,
+                        "rows_returned": workflow_state.rows_returned,
+                    }
+                    await update_session_summary(user_id, session_id, result_facts)
+
+                except Exception:
+                    logger.warning("Memory persistence failed", exc_info=True)
 
             # ── Finalize audit ────────────────────────────────
             if audit_id:

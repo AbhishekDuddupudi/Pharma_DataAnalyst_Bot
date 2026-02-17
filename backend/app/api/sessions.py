@@ -32,6 +32,12 @@ from app.services.audit import (
     finalize_audit_success,
     finalize_audit_error,
 )
+from app.services.memory import (
+    get_memory_bundle,
+    update_context_json,
+    update_last_sql_intent,
+    update_session_summary,
+)
 from app.agent.workflow import run_workflow
 from app.core.logging import get_logger
 
@@ -47,6 +53,7 @@ class SessionOut(BaseModel):
     id: int
     user_id: int
     title: str | None = None
+    summary: str | None = None
     created_at: str
     updated_at: str
 
@@ -139,6 +146,13 @@ async def chat(body: ChatRequest, user: dict[str, Any] = Depends(require_auth)):
     history_rows = await get_recent_messages(user_id, session_id, limit=6)
     history = [{"role": h["role"], "content": h["content"]} for h in history_rows]
 
+    # Load memory bundle
+    memory_bundle: dict = {}
+    try:
+        memory_bundle = await get_memory_bundle(user_id, session_id)
+    except Exception:
+        logger.warning("Failed to load memory bundle", exc_info=True)
+
     # Create audit entry
     audit_id: int | None = None
     try:
@@ -158,7 +172,7 @@ async def chat(body: ChatRequest, user: dict[str, Any] = Depends(require_auth)):
     # Run the full workflow
     t0 = time.perf_counter()
     try:
-        state = await run_workflow(body.message, history, _noop_emit)
+        state = await run_workflow(body.message, history, _noop_emit, memory_bundle=memory_bundle)
     except Exception as exc:
         if audit_id:
             try:
@@ -208,6 +222,45 @@ async def chat(body: ChatRequest, user: dict[str, Any] = Depends(require_auth)):
         followups=state.follow_ups or None,
         metrics_json=metrics_data,
     )
+
+    # Persist memory (only on successful, non-blocked runs)
+    if not state.blocked and not state.rejected:
+        try:
+            grounding = state.grounding_parsed or {}
+            intent_payload: dict[str, Any] = {
+                "metric": grounding.get("metrics", [None])[0] if grounding.get("metrics") else None,
+                "dimensions": grounding.get("columns", []),
+                "filters": grounding.get("filters", []),
+                "time_window": grounding.get("time_range", ""),
+                "tables_used": state.tables_used,
+                "last_sql_tasks": [
+                    {"title": t.title, "sql": t.sql[:500]}
+                    for t in state.tasks if t.sql
+                ],
+                "result_stats": {"rows": state.rows_returned},
+            }
+            await update_last_sql_intent(user_id, session_id, intent_payload)
+
+            ctx_patch: dict[str, Any] = {}
+            if grounding.get("metrics"):
+                ctx_patch["metric"] = grounding["metrics"][0]
+            if grounding.get("columns"):
+                ctx_patch["dimensions"] = grounding["columns"]
+            if grounding.get("filters"):
+                ctx_patch["filters"] = grounding["filters"]
+            if grounding.get("time_range"):
+                ctx_patch["time_window"] = grounding["time_range"]
+            if ctx_patch:
+                await update_context_json(user_id, session_id, ctx_patch)
+
+            result_facts = {
+                "tasks_count": len(state.tasks),
+                "tables_used": state.tables_used,
+                "rows_returned": state.rows_returned,
+            }
+            await update_session_summary(user_id, session_id, result_facts)
+        except Exception:
+            logger.warning("Memory persistence failed", exc_info=True)
 
     # Finalize audit
     if audit_id:

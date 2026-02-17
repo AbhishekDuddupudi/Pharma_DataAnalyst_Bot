@@ -92,6 +92,56 @@ async def call_llm_json(
     }
 
 
+# ── Plain-text call (no JSON mode) ──────────────────────────────
+
+
+async def call_llm_text(
+    system: str,
+    user: str,
+    *,
+    model: str | None = None,
+    temperature: float = 0.2,
+    max_tokens: int = 1024,
+) -> dict[str, Any]:
+    """
+    Call the LLM and return the raw text response (no JSON parsing).
+
+    Returns dict with ``text``, ``tokens_in``, ``tokens_out``, ``llm_ms``.
+    """
+    client = _get_client()
+    model = model or settings.OPENAI_MODEL
+
+    t0 = time.perf_counter()
+
+    response = await client.chat.completions.create(
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    )
+
+    elapsed_ms = round((time.perf_counter() - t0) * 1000)
+    text = response.choices[0].message.content or ""
+    usage = response.usage
+    tokens_in = usage.prompt_tokens if usage else 0
+    tokens_out = usage.completion_tokens if usage else 0
+
+    logger.info(
+        "LLM text call: model=%s in=%d out=%d ms=%d",
+        model, tokens_in, tokens_out, elapsed_ms,
+    )
+
+    return {
+        "text": text,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "llm_ms": elapsed_ms,
+    }
+
+
 # ── Token streaming ─────────────────────────────────────────────
 
 

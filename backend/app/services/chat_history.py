@@ -36,7 +36,7 @@ async def create_session(user_id: int) -> dict[str, Any]:
         row = await conn.fetchrow(
             "INSERT INTO chat_session (user_id) "
             "VALUES ($1) "
-            "RETURNING id, user_id, title, created_at, updated_at",
+            "RETURNING id, user_id, title, summary, created_at, updated_at",
             user_id,
         )
         logger.info("Chat session %s created for user_id=%s", row["id"], user_id)
@@ -50,7 +50,7 @@ async def list_sessions(user_id: int) -> list[dict[str, Any]]:
     conn = await _get_conn()
     try:
         rows = await conn.fetch(
-            "SELECT id, user_id, title, created_at, updated_at "
+            "SELECT id, user_id, title, summary, created_at, updated_at "
             "FROM chat_session "
             "WHERE user_id = $1 "
             "ORDER BY updated_at DESC",
@@ -66,7 +66,7 @@ async def get_session(user_id: int, session_id: int) -> dict[str, Any] | None:
     conn = await _get_conn()
     try:
         row = await conn.fetchrow(
-            "SELECT id, user_id, title, created_at, updated_at "
+            "SELECT id, user_id, title, summary, created_at, updated_at "
             "FROM chat_session "
             "WHERE id = $1 AND user_id = $2",
             session_id,

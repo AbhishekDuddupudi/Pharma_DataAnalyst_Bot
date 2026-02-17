@@ -55,6 +55,12 @@ _ANALYTICS_DOMAINS = {
     "growth", "decline", "market", "share", "performance",
     "brand", "therapeutic", "oncology", "cardiovascular", "respiratory", "cns",
     "forecast", "average", "total", "sum", "count",
+    # Time refs
+    "q1", "q2", "q3", "q4", "2023", "2024", "2025", "ytd",
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+    # Geography
+    "northeast", "southeast", "midwest", "west", "south", "north",
 }
 
 _BLOCKED_PATTERNS: list[re.Pattern] = [
@@ -124,6 +130,7 @@ class WorkflowState:
     """Accumulates state across nodes."""
     user_message: str = ""
     history: list[dict] = field(default_factory=list)
+    memory_bundle: dict = field(default_factory=dict)
     mode: str = "simple"          # "simple" or "insights"
     preprocessed: str = ""
     grounding: str = ""
@@ -190,6 +197,61 @@ def _schema_summary() -> str:
     return "\n".join(parts)
 
 
+# ── Memory context formatter ─────────────────────────────────────
+
+_FOLLOW_UP_RULE = (
+    "FOLLOW-UP HANDLING RULE:\n"
+    "If the new user message is a follow-up (uses words like 'same', 'that', "
+    "'previous', 'now filter', 'break down', 'for last quarter', 'by month', etc.), "
+    "REUSE the previous analysis intent below and ONLY modify what the user changed.\n"
+    "If the user clearly changes topic, ignore the previous intent and treat as fresh.\n"
+)
+
+
+def _format_memory_context(bundle: dict) -> str:
+    """Build a compact memory block for LLM system prompts.
+
+    Order (most important first):
+      1. last_sql_intent  – source of truth for follow-ups
+      2. context_json     – structured assumptions / state
+      3. summary          – long-term session summary
+      4. recent_messages  – last 5 turns
+    """
+    parts: list[str] = []
+
+    intent = bundle.get("last_sql_intent") or {}
+    if intent:
+        parts.append(
+            "PREVIOUS ANALYSIS INTENT (source of truth for follow-ups):\n"
+            + json.dumps(intent, indent=2, default=str)
+        )
+
+    ctx = bundle.get("context_json") or {}
+    if ctx:
+        parts.append(
+            "CURRENT STRUCTURED CONTEXT:\n"
+            + json.dumps(ctx, indent=2, default=str)
+        )
+
+    summary = bundle.get("summary") or ""
+    if summary:
+        parts.append(f"SESSION SUMMARY:\n{summary}")
+
+    recent = bundle.get("recent_messages") or []
+    if recent:
+        lines = [f"  {m['role'].upper()}: {m['content'][:200]}" for m in recent]
+        parts.append("RECENT CONVERSATION:\n" + "\n".join(lines))
+
+    if not parts:
+        return ""
+    return (
+        "\n\n--- CONVERSATION MEMORY ---\n"
+        + _FOLLOW_UP_RULE
+        + "\n\n".join(parts)
+        + "\n--- END MEMORY ---\n"
+    )
+
+
 # ── Node implementations ────────────────────────────────────────
 
 
@@ -235,7 +297,23 @@ async def _scope_policy_check(state: WorkflowState, emit: Emitter) -> None:
             logger.info("Scope BLOCKED by rules: %s", state.preprocessed[:80])
             return
 
-    # ── Step B: greetings / small-talk about the bot → allow ─
+    # ── Step B: follow-up with existing intent → allow ─────
+    _FOLLOW_UP_WORDS = {
+        "same", "that", "those", "previous", "last", "above",
+        "now", "filter", "break", "breakdown", "drill", "split",
+        "instead", "also", "but", "compare", "versus", "vs",
+        "again", "more", "detail", "monthly", "quarterly", "weekly",
+    }
+    intent = (state.memory_bundle.get("last_sql_intent") or {})
+    if intent and (words & _FOLLOW_UP_WORDS):
+        await emit("status", {
+            "step": "scope_policy_check",
+            "message": "Allowed (rules) — follow-up on previous analysis",
+        })
+        logger.info("Scope ALLOWED by rules: follow-up detected (intent exists)")
+        return
+
+    # ── Step C: greetings / small-talk about the bot → allow ─
     greeting_words = {"hi", "hello", "hey", "help", "what", "who", "how"}
     bot_words = {"bot", "analyst", "you", "pharma"}
     if words & greeting_words and (len(words) < 6 or words & bot_words):
@@ -246,10 +324,24 @@ async def _scope_policy_check(state: WorkflowState, emit: Emitter) -> None:
         logger.info("Scope ALLOWED by rules: greeting")
         return
 
-    # ── Step C: analytics domain match → allow ───────────────
+    # ── Step D: analytics domain match → allow ───────────────
+    # Also check known product/entity names as domain signals
+    schema = _load_schema()
+    known = schema.get("known_entities", {})
+    known_names: set[str] = set()
+    for lst in (known.get("products") or [],
+                known.get("therapeutic_areas") or [],
+                known.get("regions") or [],
+                known.get("companies") or [],
+                known.get("states") or []):
+        for name in lst:
+            known_names.add(name.lower())
+    entity_overlap = words & known_names
+
     domain_overlap = words & _ANALYTICS_DOMAINS
-    if len(domain_overlap) >= 2:
-        # ── Step C2: vague insight detection ──────────────────
+    combined_score = len(domain_overlap) + len(entity_overlap)
+    if combined_score >= 2:
+        # ── Step D2: vague insight detection ──────────────────
         # If it's an insight-mode question, check for specificity
         if state.mode == "insights":
             schema = _load_schema()
@@ -291,7 +383,7 @@ async def _scope_policy_check(state: WorkflowState, emit: Emitter) -> None:
         logger.info("Scope ALLOWED by rules: domains=%s", domain_overlap)
         return
 
-    # ── Step D: ambiguous → LLM fallback ─────────────────────
+    # ── Step E: ambiguous → LLM fallback ─────────────────────
     await emit("status", {
         "step": "scope_policy_check",
         "message": "Ambiguous → using LLM scope check",
@@ -303,10 +395,17 @@ async def _scope_policy_check(state: WorkflowState, emit: Emitter) -> None:
         "The bot can ONLY answer questions about pharmaceutical sales data "
         "(sales, revenue, prescriptions, products, territories, trends, comparisons). "
         "Return JSON: {\"in_scope\": true/false, \"reason\": \"...\"}\n"
-        "If the question is a greeting or chitchat about the bot itself, mark in_scope=true."
+        "If the question is a greeting or chitchat about the bot itself, mark in_scope=true.\n"
+        "If the question is a follow-up referencing a previous analysis, mark in_scope=true."
     )
 
-    resp = await call_llm_json(system, state.preprocessed)
+    # Give the LLM scope-checker conversation context so follow-ups aren't rejected
+    summary = (state.memory_bundle.get("summary") or "")
+    user_text = state.preprocessed
+    if summary:
+        user_text = f"Session context: {summary[:300]}\n\nUser message: {state.preprocessed}"
+
+    resp = await call_llm_json(system, user_text)
     state.llm_ms += resp["llm_ms"]
     result = resp["result"]
 
@@ -330,10 +429,12 @@ async def _semantic_grounding(state: WorkflowState, emit: Emitter) -> None:
     await emit("status", {"step": "semantic_grounding", "message": "Mapping to schema…"})
 
     schema_text = _schema_summary()
+    memory_text = _format_memory_context(state.memory_bundle)
     system = (
         "You are a semantic grounding agent. Given a user question and the database schema below, "
         "identify the relevant tables, columns, filters, time ranges, and metrics.\n\n"
         f"SCHEMA:\n{schema_text}\n\n"
+        f"{memory_text}\n\n"
         "Return JSON: {\"tables\": [...], \"columns\": [...], \"filters\": [...], "
         "\"time_range\": \"...\", \"metrics\": [...], \"notes\": \"...\"}"
     )
@@ -353,6 +454,7 @@ async def _analysis_planner(state: WorkflowState, emit: Emitter) -> None:
     await emit("status", {"step": "analysis_planner", "message": "Planning analysis…"})
 
     schema_text = _schema_summary()
+    memory_text = _format_memory_context(state.memory_bundle)
     n_tasks = "3-4" if state.mode == "insights" else "1"
 
     system = (
@@ -360,6 +462,7 @@ async def _analysis_planner(state: WorkflowState, emit: Emitter) -> None:
         f"Create {n_tasks} analysis tasks to answer the user's question.\n\n"
         f"SCHEMA:\n{schema_text}\n\n"
         f"GROUNDING:\n{state.grounding}\n\n"
+        f"{memory_text}\n\n"
         "Return JSON: {\"tasks\": [{\"title\": \"...\", \"description\": \"...\"}]}\n"
         "Each task should be a self-contained analytical query. "
         "Keep titles concise (under 10 words)."
@@ -388,6 +491,8 @@ async def _sql_generator(state: WorkflowState, emit: Emitter) -> None:
             hist_lines.append(f"{h['role'].upper()}: {h['content'][:200]}")
         history_text = "\nRecent conversation:\n" + "\n".join(hist_lines) + "\n"
 
+    memory_text = _format_memory_context(state.memory_bundle)
+
     for task in state.tasks:
         system = (
             "You are a PostgreSQL SQL generator for pharmaceutical sales data.\n"
@@ -395,6 +500,7 @@ async def _sql_generator(state: WorkflowState, emit: Emitter) -> None:
             f"GROUNDING:\n{state.grounding}\n\n"
             f"POLICY: {policy}\n"
             f"{history_text}"
+            f"{memory_text}\n"
             "Generate ONLY a valid PostgreSQL SELECT query. No explanation.\n"
             "Return JSON: {\"sql\": \"SELECT ...\"}\n"
             "Rules:\n"
@@ -712,6 +818,7 @@ async def run_workflow(
     user_message: str,
     history: list[dict],
     emit: Emitter,
+    memory_bundle: dict | None = None,
 ) -> WorkflowState:
     """
     Execute the full 10-node workflow.
@@ -720,12 +827,14 @@ async def run_workflow(
         user_message – the user's question.
         history – recent conversation history [{role, content}, …].
         emit – async callback ``(event_type, data_dict) -> None``.
+        memory_bundle – 4-layer memory dict from memory service (optional).
 
     Returns the final WorkflowState with all results.
     """
     state = WorkflowState(
         user_message=user_message,
         history=history,
+        memory_bundle=memory_bundle or {},
         total_t0=time.perf_counter(),
     )
 
