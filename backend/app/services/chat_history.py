@@ -90,7 +90,8 @@ async def list_messages(user_id: int, session_id: int) -> list[dict[str, Any]]:
     conn = await _get_conn()
     try:
         rows = await conn.fetch(
-            "SELECT id, session_id, role, content, sql_query, metadata, created_at "
+            "SELECT id, session_id, role, content, sql_query, metadata, "
+            "artifacts_json, assumptions, followups, metrics_json, created_at "
             "FROM chat_message "
             "WHERE session_id = $1 "
             "ORDER BY created_at ASC",
@@ -107,21 +108,28 @@ async def add_message(
     content: str,
     sql_query: str | None = None,
     metadata: dict[str, Any] | None = None,
+    artifacts_json: dict[str, Any] | None = None,
+    assumptions: list[str] | None = None,
+    followups: list[str] | None = None,
+    metrics_json: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Insert a message and touch the session's updated_at."""
     import json as _json
     conn = await _get_conn()
     try:
-        meta_json = _json.dumps(metadata) if metadata else None
+        meta_j = _json.dumps(metadata) if metadata else None
+        art_j  = _json.dumps(artifacts_json) if artifacts_json else None
+        asm_j  = _json.dumps(assumptions) if assumptions else None
+        fu_j   = _json.dumps(followups) if followups else None
+        met_j  = _json.dumps(metrics_json) if metrics_json else None
         row = await conn.fetchrow(
-            "INSERT INTO chat_message (session_id, role, content, sql_query, metadata) "
-            "VALUES ($1, $2, $3, $4, $5::jsonb) "
-            "RETURNING id, session_id, role, content, sql_query, metadata, created_at",
-            session_id,
-            role,
-            content,
-            sql_query,
-            meta_json,
+            "INSERT INTO chat_message "
+            "(session_id, role, content, sql_query, metadata, artifacts_json, assumptions, followups, metrics_json) "
+            "VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb, $9::jsonb) "
+            "RETURNING id, session_id, role, content, sql_query, metadata, "
+            "artifacts_json, assumptions, followups, metrics_json, created_at",
+            session_id, role, content, sql_query,
+            meta_j, art_j, asm_j, fu_j, met_j,
         )
         # Bump session updated_at
         await conn.execute(
@@ -149,7 +157,8 @@ async def get_recent_messages(
     conn = await _get_conn()
     try:
         rows = await conn.fetch(
-            "SELECT id, session_id, role, content, sql_query, metadata, created_at "
+            "SELECT id, session_id, role, content, sql_query, metadata, "
+            "artifacts_json, assumptions, followups, metrics_json, created_at "
             "FROM chat_message "
             "WHERE session_id = $1 "
             "ORDER BY created_at DESC "
@@ -228,11 +237,12 @@ def _message_to_dict(row: asyncpg.Record) -> dict[str, Any]:
     d = dict(row)
     if isinstance(d.get("created_at"), datetime):
         d["created_at"] = d["created_at"].isoformat()
-    # Parse metadata JSONB if present (asyncpg returns str or None)
-    meta = d.get("metadata")
-    if meta is not None and isinstance(meta, str):
-        try:
-            d["metadata"] = _json.loads(meta)
-        except Exception:
-            d["metadata"] = None
+    # Parse JSONB fields (asyncpg may return str or dict or None)
+    for key in ("metadata", "artifacts_json", "assumptions", "followups", "metrics_json"):
+        val = d.get(key)
+        if val is not None and isinstance(val, str):
+            try:
+                d[key] = _json.loads(val)
+            except Exception:
+                d[key] = None
     return d

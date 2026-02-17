@@ -124,7 +124,6 @@ class WorkflowState:
     """Accumulates state across nodes."""
     user_message: str = ""
     history: list[dict] = field(default_factory=list)
-    memory: Any = None             # MemoryBundle (set by caller)
     mode: str = "simple"          # "simple" or "insights"
     preprocessed: str = ""
     grounding: str = ""
@@ -331,16 +330,10 @@ async def _semantic_grounding(state: WorkflowState, emit: Emitter) -> None:
     await emit("status", {"step": "semantic_grounding", "message": "Mapping to schema…"})
 
     schema_text = _schema_summary()
-    memory_block = state.memory.format_for_prompt() if state.memory else ""
-    memory_section = f"\n\nMEMORY CONTEXT:\n{memory_block}" if memory_block else ""
     system = (
         "You are a semantic grounding agent. Given a user question and the database schema below, "
         "identify the relevant tables, columns, filters, time ranges, and metrics.\n\n"
-        f"SCHEMA:\n{schema_text}"
-        f"{memory_section}\n\n"
-        "If the user's question is a FOLLOW-UP (mentions 'that', 'same', 'previous', 'now filter', "
-        "'break down', 'show me the same', etc.), reuse relevant context from the memory.\n"
-        "If the question changes topic entirely, ignore prior context.\n\n"
+        f"SCHEMA:\n{schema_text}\n\n"
         "Return JSON: {\"tables\": [...], \"columns\": [...], \"filters\": [...], "
         "\"time_range\": \"...\", \"metrics\": [...], \"notes\": \"...\"}"
     )
@@ -361,17 +354,12 @@ async def _analysis_planner(state: WorkflowState, emit: Emitter) -> None:
 
     schema_text = _schema_summary()
     n_tasks = "3-4" if state.mode == "insights" else "1"
-    memory_block = state.memory.format_for_prompt() if state.memory else ""
-    memory_section = f"\n\nMEMORY CONTEXT:\n{memory_block}" if memory_block else ""
 
     system = (
         "You are an analysis planner for a pharmaceutical data analyst bot.\n"
         f"Create {n_tasks} analysis tasks to answer the user's question.\n\n"
         f"SCHEMA:\n{schema_text}\n\n"
-        f"GROUNDING:\n{state.grounding}"
-        f"{memory_section}\n\n"
-        "If the user is asking a follow-up (e.g. 'same for Q4', 'now by region'), "
-        "adapt the previous analysis intent rather than starting from scratch.\n\n"
+        f"GROUNDING:\n{state.grounding}\n\n"
         "Return JSON: {\"tasks\": [{\"title\": \"...\", \"description\": \"...\"}]}\n"
         "Each task should be a self-contained analytical query. "
         "Keep titles concise (under 10 words)."
@@ -392,9 +380,13 @@ async def _sql_generator(state: WorkflowState, emit: Emitter) -> None:
     schema_text = _schema_summary()
     policy = get_allowlist_summary()
 
-    # Build memory context (replaces raw history for prompting)
-    memory_block = state.memory.format_for_prompt() if state.memory else ""
-    memory_section = f"\nMEMORY CONTEXT:\n{memory_block}\n" if memory_block else ""
+    # Build history context
+    history_text = ""
+    if state.history:
+        hist_lines = []
+        for h in state.history[-5:]:
+            hist_lines.append(f"{h['role'].upper()}: {h['content'][:200]}")
+        history_text = "\nRecent conversation:\n" + "\n".join(hist_lines) + "\n"
 
     for task in state.tasks:
         system = (
@@ -402,7 +394,7 @@ async def _sql_generator(state: WorkflowState, emit: Emitter) -> None:
             f"SCHEMA:\n{schema_text}\n\n"
             f"GROUNDING:\n{state.grounding}\n\n"
             f"POLICY: {policy}\n"
-            f"{memory_section}"
+            f"{history_text}"
             "Generate ONLY a valid PostgreSQL SELECT query. No explanation.\n"
             "Return JSON: {\"sql\": \"SELECT ...\"}\n"
             "Rules:\n"
@@ -623,6 +615,22 @@ async def _viz_builder(state: WorkflowState, emit: Emitter) -> None:
     await emit("artifact_chart", spec)
 
 
+def _strip_markdown(text: str) -> str:
+    """Remove residual markdown tokens the LLM may sneak in."""
+    # Remove heading markers
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
+    # Remove bold/italic markers (preserve the text inside)
+    text = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", text)
+    text = re.sub(r"_{1,3}([^_]+)_{1,3}", r"\1", text)
+    # Remove backtick code spans (preserve content)
+    text = re.sub(r"`{1,3}([^`]*)`{1,3}", r"\1", text)
+    # Normalise bullet chars to simple dash
+    text = re.sub(r"^\s*[•●▪]\s*", "- ", text, flags=re.MULTILINE)
+    # Collapse excessive blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 async def _response_synthesizer(state: WorkflowState, emit: Emitter) -> None:
     """Node 10: produce a structured answer with assumptions + follow-ups."""
     await emit("status", {"step": "response_synthesizer", "message": "Writing answer…"})
@@ -653,14 +661,17 @@ async def _response_synthesizer(state: WorkflowState, emit: Emitter) -> None:
         "}\n\n"
         "Rules for the 'answer' field:\n"
         "- Write a clear, professional summary of the findings.\n"
-        "- You may use markdown headings (## or ###), bold (**text**), and bullet lists.\n"
+        "- PLAIN TEXT ONLY. Do NOT use any markdown formatting whatsoever.\n"
+        "- No #, ##, ###, **, *, `, ``` or any other markdown syntax.\n"
+        "- Use short descriptive lines as section labels (e.g. 'Top Products by Revenue:').\n"
+        "- Use simple dashes (- ) for bullet lists, no bold or emphasis.\n"
         "- Mention specific values, percentages, and trends from the data.\n"
-        "- NEVER include SQL code, query text, or table names in the answer.\n"
+        "- NEVER include SQL code, query text, or technical table/column names.\n"
         "- Keep it under 250 words.\n"
-        "- If there were errors, explain what happened.\n\n"
+        "- If there were errors, explain what happened in plain language.\n\n"
         "Rules for 'assumptions':\n"
         "- List 1-3 key assumptions made (e.g. time range, metric used, filters applied).\n"
-        "- Each assumption should be a short sentence.\n\n"
+        "- Each assumption should be a short plain-text sentence.\n\n"
         "Rules for 'follow_ups':\n"
         "- Suggest 2-3 natural follow-up questions the user might ask next.\n"
         "- Keep each under 12 words.\n"
@@ -673,7 +684,8 @@ async def _response_synthesizer(state: WorkflowState, emit: Emitter) -> None:
     state.llm_ms += resp["llm_ms"]
     result = resp["result"]
 
-    answer = result.get("answer", "I was unable to generate a summary.")
+    raw_answer = result.get("answer", "I was unable to generate a summary.")
+    answer = _strip_markdown(raw_answer)
     state.assumptions = result.get("assumptions", [])
     state.follow_ups = result.get("follow_ups", [])
 
@@ -700,7 +712,6 @@ async def run_workflow(
     user_message: str,
     history: list[dict],
     emit: Emitter,
-    memory: Any | None = None,
 ) -> WorkflowState:
     """
     Execute the full 10-node workflow.
@@ -709,14 +720,12 @@ async def run_workflow(
         user_message – the user's question.
         history – recent conversation history [{role, content}, …].
         emit – async callback ``(event_type, data_dict) -> None``.
-        memory – optional MemoryBundle for multi-turn context.
 
     Returns the final WorkflowState with all results.
     """
     state = WorkflowState(
         user_message=user_message,
         history=history,
-        memory=memory,
         total_t0=time.perf_counter(),
     )
 

@@ -40,12 +40,6 @@ from app.services.audit import (
     finalize_audit_error,
 )
 from app.agent.workflow import run_workflow
-from app.services.memory import (
-    get_memory_bundle,
-    update_session_summary,
-    update_context_json,
-    update_last_sql_intent,
-)
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -119,9 +113,6 @@ async def _generate_stream(
         history_rows = await get_recent_messages(user_id, session_id, limit=6)
         history = [{"role": h["role"], "content": h["content"]} for h in history_rows]
 
-        # ── Load memory bundle (4-layer) ──────────────────────
-        memory = await get_memory_bundle(user_id, session_id)
-
         # ── Create audit log entry ────────────────────────────
         audit_id: int | None = None
         try:
@@ -144,9 +135,7 @@ async def _generate_stream(
         async def _run_workflow():
             nonlocal workflow_state, workflow_error
             try:
-                workflow_state = await run_workflow(
-                    body.message, history, emit, memory=memory,
-                )
+                workflow_state = await run_workflow(body.message, history, emit)
             except Exception as exc:
                 workflow_error = str(exc)
                 logger.exception("Workflow error for user %s", user_id)
@@ -228,74 +217,44 @@ async def _generate_stream(
             # ── Persist assistant message ─────────────────────
             sql_queries = "; ".join(t.sql for t in workflow_state.tasks if t.sql)
 
-            # Build metadata for artifact restoration on history load
-            metadata: dict[str, Any] = {}
-            if workflow_state.tasks:
-                metadata["sql_tasks"] = [
-                    {"title": t.title, "sql": t.sql}
-                    for t in workflow_state.tasks if t.sql
-                ]
-            if workflow_state.tasks:
-                tables = []
-                for t in workflow_state.tasks:
-                    if t.result and t.result.rows:
-                        tables.append({
-                            "title": t.title,
-                            "columns": t.result.columns,
-                            "rows": t.result.rows[:50],  # cap for storage
-                        })
-                if tables:
-                    metadata["tables"] = tables
+            # Build structured artifacts for dedicated columns
+            artifacts_data: dict[str, Any] = {}
+            sql_tasks_list = [
+                {"title": t.title, "sql": t.sql}
+                for t in workflow_state.tasks if t.sql
+            ]
+            if sql_tasks_list:
+                artifacts_data["sql_tasks"] = sql_tasks_list
+            tables_list = []
+            for t in workflow_state.tasks:
+                if t.result and t.result.rows:
+                    tables_list.append({
+                        "title": t.title,
+                        "columns": t.result.columns,
+                        "rows": t.result.rows[:50],
+                    })
+            if tables_list:
+                artifacts_data["tables"] = tables_list
             if workflow_state.chart_spec:
-                metadata["chart"] = workflow_state.chart_spec
-            if workflow_state.assumptions:
-                metadata["assumptions"] = workflow_state.assumptions
-            if workflow_state.follow_ups:
-                metadata["follow_ups"] = workflow_state.follow_ups
+                artifacts_data["chart"] = workflow_state.chart_spec
+
+            metrics_data: dict[str, Any] = {
+                "total_ms": total_ms,
+                "llm_ms": workflow_state.llm_ms,
+                "db_ms": workflow_state.db_ms,
+                "rows_returned": workflow_state.rows_returned,
+            }
 
             await add_message(
                 session_id,
                 "assistant",
                 workflow_state.answer_text,
                 sql_query=sql_queries or None,
-                metadata=metadata or None,
+                artifacts_json=artifacts_data or None,
+                assumptions=workflow_state.assumptions or None,
+                followups=workflow_state.follow_ups or None,
+                metrics_json=metrics_data,
             )
-
-            # ── Update memory bundle ──────────────────────────
-            if not workflow_state.blocked and not workflow_state.rejected:
-                try:
-                    # D) SQL intent – anchor for follow-ups
-                    if workflow_state.tasks:
-                        primary = workflow_state.tasks[0]
-                        intent = {
-                            "metric": (workflow_state.grounding_parsed.get("metrics") or [""])[0],
-                            "dimensions": workflow_state.grounding_parsed.get("columns", []),
-                            "filters": workflow_state.grounding_parsed.get("filters", []),
-                            "time_window": workflow_state.grounding_parsed.get("time_range", ""),
-                            "tables_used": workflow_state.tables_used,
-                            "last_sql_tasks": [
-                                {"task_id": f"t{i}", "purpose": t.title, "sql": t.sql}
-                                for i, t in enumerate(workflow_state.tasks) if t.sql
-                            ],
-                            "result_stats": {
-                                "rows": workflow_state.rows_returned,
-                            },
-                        }
-                        await update_last_sql_intent(user_id, session_id, intent)
-
-                    # C) Context JSON – structured state
-                    ctx_patch = {
-                        "metric": (workflow_state.grounding_parsed.get("metrics") or [None])[0],
-                        "tables": workflow_state.tables_used,
-                        "filters": workflow_state.grounding_parsed.get("filters", []),
-                        "time_window": workflow_state.grounding_parsed.get("time_range"),
-                    }
-                    await update_context_json(user_id, session_id, ctx_patch)
-
-                    # B) Session summary (cheap LLM call)
-                    await update_session_summary(user_id, session_id)
-                except Exception:
-                    logger.warning("Memory update failed", exc_info=True)
 
             # ── Finalize audit ────────────────────────────────
             if audit_id:

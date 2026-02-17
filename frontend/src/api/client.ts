@@ -103,6 +103,19 @@ export interface Message {
   content: string;
   sql_query: string | null;
   metadata: AssistantMetadata | null;
+  artifacts_json: {
+    sql_tasks?: { title: string; sql: string; error?: string }[];
+    tables?: { title: string; columns: string[]; rows: unknown[][] }[];
+    chart?: ChartArtifact | null;
+  } | null;
+  assumptions: string[] | null;
+  followups: string[] | null;
+  metrics_json: {
+    total_ms?: number;
+    llm_ms?: number;
+    db_ms?: number;
+    rows_returned?: number;
+  } | null;
   created_at: string;
 }
 

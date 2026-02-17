@@ -1,6 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import {
   getSessions,
   getSessionMessages,
@@ -12,7 +10,6 @@ import type {
   SqlTask,
   TableArtifact,
   ChartArtifact,
-  MetricsData,
   RetryData,
   CompleteData,
 } from "../api/client";
@@ -36,6 +33,19 @@ const STEP_LABELS: Record<string, string> = {
 
 const STEP_KEYS = Object.keys(STEP_LABELS);
 
+/* ── Strip residual markdown from old stored messages ─ */
+
+function stripMarkdown(text: string): string {
+  return text
+    .replace(/^#{1,6}\s+/gm, "")       // headings
+    .replace(/\*\*(.+?)\*\*/g, "$1")    // bold
+    .replace(/\*(.+?)\*/g, "$1")        // italic
+    .replace(/`{1,3}([^`]*)`{1,3}/g, "$1") // inline code / fenced
+    .replace(/^[\s]*[-•]\s+/gm, "- ")   // normalize bullets
+    .replace(/\n{3,}/g, "\n\n")         // collapse blank lines
+    .trim();
+}
+
 /* ── Artifact types ───────────────────────────────── */
 
 interface Artifacts {
@@ -43,8 +53,6 @@ interface Artifacts {
   tables: TableArtifact[];
   chart: ChartArtifact | null;
 }
-
-type ArtifactTab = "answer" | "sql" | "table" | "chart";
 
 const EMPTY_ARTIFACTS: Artifacts = { sqlTasks: [], tables: [], chart: null };
 
@@ -64,14 +72,13 @@ export default function Chat() {
   const [streamingText, setStreamingText] = useState("");
   const [activeStep, setActiveStep] = useState<string | null>(null);
   const [completedSteps, setCompletedSteps] = useState<Set<string>>(new Set());
-  const [artifacts, setArtifacts] = useState<Artifacts>(EMPTY_ARTIFACTS);
-  const [activeTab, setActiveTab] = useState<ArtifactTab>("answer");
   const [showProgress, setShowProgress] = useState(false);
-  const [lastArtifacts, setLastArtifacts] = useState<Artifacts>(EMPTY_ARTIFACTS);
-  const [showArtifactTabs, setShowArtifactTabs] = useState(false);
-  const [metrics, setMetrics] = useState<MetricsData | null>(null);
-  const [selectedTableIdx, setSelectedTableIdx] = useState(0);
   const [retries, setRetries] = useState<RetryData[]>([]);
+  const [streamAssumptions, setStreamAssumptions] = useState<string[]>([]);
+  const [streamFollowUps, setStreamFollowUps] = useState<string[]>([]);
+  /* After streaming ends, hold the last stream's data until messages reload */
+  const [lastStreamArtifacts, setLastStreamArtifacts] = useState<Artifacts>(EMPTY_ARTIFACTS);
+  const [lastStreamMeta, setLastStreamMeta] = useState<{ assumptions: string[]; followups: string[] } | null>(null);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -119,7 +126,6 @@ export default function Chat() {
     abortRef.current?.abort();
     resetStreamState();
     setActiveSessionId(id);
-    setShowArtifactTabs(false);
   }
 
   function handleNewChat() {
@@ -128,7 +134,10 @@ export default function Chat() {
     setActiveSessionId(null);
     setMessages([]);
     setInput("");
-    setShowArtifactTabs(false);
+  }
+
+  function handleFollowUp(question: string) {
+    setInput(question);
   }
 
   function resetStreamState() {
@@ -137,11 +146,11 @@ export default function Chat() {
     setActiveStep(null);
     setCompletedSteps(new Set());
     setShowProgress(false);
-    setArtifacts(EMPTY_ARTIFACTS);
-    setActiveTab("answer");
-    setMetrics(null);
-    setSelectedTableIdx(0);
     setRetries([]);
+    setStreamAssumptions([]);
+    setStreamFollowUps([]);
+    setLastStreamArtifacts(EMPTY_ARTIFACTS);
+    setLastStreamMeta(null);
   }
 
   async function handleSend(e: React.FormEvent) {
@@ -155,12 +164,11 @@ export default function Chat() {
     setActiveStep(null);
     setCompletedSteps(new Set());
     setShowProgress(true);
-    setShowArtifactTabs(false);
-    setArtifacts(EMPTY_ARTIFACTS);
-    setActiveTab("answer");
-    setMetrics(null);
-    setSelectedTableIdx(0);
     setRetries([]);
+    setStreamAssumptions([]);
+    setStreamFollowUps([]);
+    setLastStreamArtifacts(EMPTY_ARTIFACTS);
+    setLastStreamMeta(null);
 
     // Optimistic user bubble
     const optimistic: Message = {
@@ -169,6 +177,11 @@ export default function Chat() {
       role: "user",
       content: text,
       sql_query: null,
+      metadata: null,
+      artifacts_json: null,
+      assumptions: null,
+      followups: null,
+      metrics_json: null,
       created_at: new Date().toISOString(),
     };
     setMessages((prev) => [...prev, optimistic]);
@@ -176,7 +189,6 @@ export default function Chat() {
     let resolvedSessionId = activeSessionId;
     let prevStep: string | null = null;
     const streamArtifacts: Artifacts = { sqlTasks: [], tables: [], chart: null };
-    let streamMetrics: MetricsData | null = null;
 
     const controller = streamChat(
       { session_id: activeSessionId ?? undefined, message: text },
@@ -206,29 +218,27 @@ export default function Chat() {
 
         onArtifactSql(data) {
           streamArtifacts.sqlTasks = data.tasks;
-          setArtifacts((prev) => ({ ...prev, sqlTasks: data.tasks }));
         },
 
         onArtifactTable(data) {
           streamArtifacts.tables = [...streamArtifacts.tables, data];
-          setArtifacts((prev) => ({
-            ...prev,
-            tables: [...prev.tables, data],
-          }));
         },
 
         onArtifactChart(data) {
           streamArtifacts.chart = data;
-          setArtifacts((prev) => ({ ...prev, chart: data }));
+        },
+
+        onAnswerMeta(data) {
+          setStreamAssumptions(data.assumptions ?? []);
+          setStreamFollowUps(data.follow_ups ?? []);
         },
 
         onRetry(data) {
           setRetries((prev) => [...prev, data]);
         },
 
-        onMetrics(data) {
-          streamMetrics = data;
-          setMetrics(data);
+        onMetrics() {
+          // Metrics stored per-message in DB; no local state needed
         },
 
         async onComplete(_data: CompleteData) {
@@ -237,10 +247,11 @@ export default function Chat() {
           }
           setActiveStep(null);
           setShowProgress(false);
-          setLastArtifacts({ ...streamArtifacts });
-          setShowArtifactTabs(true);
-          if (streamMetrics) setMetrics(streamMetrics);
-
+          setLastStreamArtifacts({ ...streamArtifacts });
+          setLastStreamMeta({
+            assumptions: streamAssumptions ?? [],
+            followups: streamFollowUps ?? [],
+          });
           if (resolvedSessionId !== null) {
             await loadMessages(resolvedSessionId);
           }
@@ -298,9 +309,26 @@ export default function Chat() {
             </div>
           ) : (
             <div className="mx-auto max-w-2xl space-y-4">
-              {messages.map((m) => (
-                <MessageBubble key={m.id} message={m} />
-              ))}
+              {messages.map((m, idx) => {
+                if (m.role === "user") {
+                  return <UserBubble key={m.id} message={m} />;
+                }
+                // For the last assistant message right after streaming,
+                // overlay stream artifacts until reloaded from DB.
+                const isLast = idx === messages.length - 1 && !sending;
+                return (
+                  <AssistantBlock
+                    key={m.id}
+                    message={m}
+                    streamOverlay={
+                      isLast && lastStreamArtifacts.sqlTasks.length > 0
+                        ? { artifacts: lastStreamArtifacts, meta: lastStreamMeta }
+                        : undefined
+                    }
+                    onFollowUp={handleFollowUp}
+                  />
+                );
+              })}
 
               {showProgress && (
                 <ProgressPanel
@@ -317,17 +345,6 @@ export default function Chat() {
                     <span className="inline-block h-4 w-1.5 animate-pulse bg-neutral-400 align-text-bottom" />
                   </div>
                 </div>
-              )}
-
-              {showArtifactTabs && !sending && (
-                <ArtifactPanel
-                  artifacts={lastArtifacts}
-                  activeTab={activeTab}
-                  onTabChange={setActiveTab}
-                  metrics={metrics}
-                  selectedTableIdx={selectedTableIdx}
-                  onSelectTable={setSelectedTableIdx}
-                />
               )}
 
               <div ref={bottomRef} />
@@ -362,23 +379,363 @@ export default function Chat() {
 
 /* ── Sub-components ────────────────────────────────── */
 
-function MessageBubble({ message: m }: { message: Message }) {
+function UserBubble({ message: m }: { message: Message }) {
   return (
-    <div
-      className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
-    >
-      <div
-        className={`max-w-[80%] rounded-lg px-4 py-2.5 text-sm leading-relaxed ${
-          m.role === "user"
-            ? "bg-accent text-white"
-            : "bg-surface-overlay text-neutral-200"
-        }`}
-      >
+    <div className="flex justify-end">
+      <div className="max-w-[80%] rounded-lg bg-accent px-4 py-2.5 text-sm leading-relaxed text-white">
         <p className="whitespace-pre-wrap">{m.content}</p>
-        {m.sql_query && (
-          <pre className="mt-2 overflow-x-auto rounded bg-surface p-2 font-mono text-xs text-neutral-400">
-            {m.sql_query}
-          </pre>
+      </div>
+    </div>
+  );
+}
+
+interface StreamOverlay {
+  artifacts: { sqlTasks: SqlTask[]; tables: TableArtifact[]; chart: ChartArtifact | null };
+  meta: { assumptions: string[]; followups: string[] } | null;
+}
+
+function AssistantBlock({
+  message: m,
+  streamOverlay,
+  onFollowUp,
+}: {
+  message: Message;
+  streamOverlay?: StreamOverlay;
+  onFollowUp: (q: string) => void;
+}) {
+  const [activeTab, setActiveTab] = useState<"sql" | "table" | "chart">("sql");
+  const [selectedTableIdx, setSelectedTableIdx] = useState(0);
+
+  // Extract artifacts from DB data, falling back to legacy `metadata` then stream overlay
+  const aj = m.artifacts_json;
+  const legacy = (!aj && m.metadata) ? m.metadata as Record<string, unknown> : null;
+  const sqlSource = aj?.sql_tasks ?? (legacy?.sql_tasks as unknown[]) ?? null;
+  const tableSource = aj?.tables ?? (legacy?.tables as unknown[]) ?? null;
+  const chartSource = (aj?.chart ?? legacy?.chart ?? null) as Record<string, unknown> | null;
+
+  const sqlTasks: SqlTask[] =
+    sqlSource?.map((t: Record<string, unknown>) => ({ title: String(t.title ?? ""), sql: String(t.sql ?? "") })) ??
+    streamOverlay?.artifacts.sqlTasks ??
+    [];
+  const tables: TableArtifact[] =
+    tableSource?.map((t: Record<string, unknown>) => ({
+      task_title: String(t.title ?? t.task_title ?? ""),
+      columns: (t.columns ?? []) as string[],
+      rows: (t.rows ?? []) as unknown[][],
+      row_count: ((t.rows ?? []) as unknown[][]).length,
+      truncated: false,
+    })) ??
+    streamOverlay?.artifacts.tables ??
+    [];
+  const chart: ChartArtifact | null =
+    chartSource ? (chartSource as unknown as ChartArtifact) : streamOverlay?.artifacts.chart ?? null;
+
+  const assumptions: string[] =
+    m.assumptions ??
+    (legacy?.assumptions as string[] | undefined) ??
+    streamOverlay?.meta?.assumptions ??
+    [];
+  const followups: string[] =
+    m.followups ??
+    (legacy?.follow_ups as string[] | undefined) ??
+    streamOverlay?.meta?.followups ??
+    [];
+
+  const hasSql = sqlTasks.length > 0;
+  const hasTable = tables.length > 0;
+  const hasChart = chart?.available === true;
+  const hasAnyArtifact = hasSql || hasTable || hasChart;
+
+  // Strip markdown from old messages that were stored with markdown formatting
+  const displayContent = stripMarkdown(m.content);
+
+  return (
+    <div className="flex justify-start">
+      <div className="max-w-[80%] space-y-2">
+        {/* Answer bubble — plain text only, NO markdown, NO SQL */}
+        <div className="rounded-lg bg-surface-overlay px-4 py-2.5 text-sm leading-relaxed text-neutral-200">
+          <p className="whitespace-pre-wrap">{displayContent}</p>
+        </div>
+
+        {/* Assumptions section */}
+        {assumptions.length > 0 && (
+          <div className="rounded-lg border border-border/50 bg-surface-raised px-3 py-2">
+            <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-neutral-500">
+              Assumptions
+            </p>
+            <ul className="space-y-0.5">
+              {assumptions.map((a, i) => (
+                <li key={i} className="text-xs text-neutral-400">
+                  - {a}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {/* Follow-up chips */}
+        {followups.length > 0 && (
+          <FollowUpChips followups={followups} onFollowUp={onFollowUp} />
+        )}
+
+        {/* Artifact tabs (per-message) */}
+        {hasAnyArtifact && (
+          <ArtifactTabs
+            sqlTasks={sqlTasks}
+            tables={tables}
+            chart={chart}
+            activeTab={activeTab}
+            onTabChange={setActiveTab}
+            selectedTableIdx={selectedTableIdx}
+            onSelectTable={setSelectedTableIdx}
+          />
+        )}
+
+        {/* Metrics footer */}
+        {m.metrics_json && (
+          <div className="flex flex-wrap gap-3 px-1 text-[10px] text-neutral-500">
+            {m.metrics_json.total_ms != null && <span>Total: {m.metrics_json.total_ms}ms</span>}
+            {m.metrics_json.llm_ms != null && <span>LLM: {m.metrics_json.llm_ms}ms</span>}
+            {m.metrics_json.db_ms != null && <span>DB: {m.metrics_json.db_ms}ms</span>}
+            {m.metrics_json.rows_returned != null && (
+              <span>Rows: {m.metrics_json.rows_returned}</span>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ── Follow-up chips with "More" dropdown ─────────── */
+
+function FollowUpChips({
+  followups,
+  onFollowUp,
+}: {
+  followups: string[];
+  onFollowUp: (q: string) => void;
+}) {
+  const [showMore, setShowMore] = useState(false);
+  const visible = followups.slice(0, 3);
+  const hidden = followups.slice(3);
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      {visible.map((q, i) => (
+        <button
+          key={i}
+          onClick={() => onFollowUp(q)}
+          className="rounded-full border border-accent/40 bg-accent/10 px-3 py-1 text-xs text-accent-hover transition-colors hover:bg-accent/20"
+        >
+          {q}
+        </button>
+      ))}
+      {hidden.length > 0 && (
+        <div className="relative">
+          <button
+            onClick={() => setShowMore(!showMore)}
+            className="rounded-full border border-border bg-surface-overlay px-3 py-1 text-xs text-neutral-400 transition-colors hover:text-neutral-200"
+          >
+            More ({hidden.length})
+          </button>
+          {showMore && (
+            <div className="absolute bottom-full left-0 z-10 mb-1 min-w-[200px] rounded-lg border border-border bg-surface-raised p-1 shadow-lg">
+              {hidden.map((q, i) => (
+                <button
+                  key={i}
+                  onClick={() => {
+                    onFollowUp(q);
+                    setShowMore(false);
+                  }}
+                  className="block w-full rounded px-3 py-1.5 text-left text-xs text-neutral-300 transition-colors hover:bg-surface-overlay"
+                >
+                  {q}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── Per-message artifact tabs ────────────────────── */
+
+function ArtifactTabs({
+  sqlTasks,
+  tables,
+  chart,
+  activeTab,
+  onTabChange,
+  selectedTableIdx,
+  onSelectTable,
+}: {
+  sqlTasks: SqlTask[];
+  tables: TableArtifact[];
+  chart: ChartArtifact | null;
+  activeTab: "sql" | "table" | "chart";
+  onTabChange: (tab: "sql" | "table" | "chart") => void;
+  selectedTableIdx: number;
+  onSelectTable: (idx: number) => void;
+}) {
+  const hasSql = sqlTasks.length > 0;
+  const hasTable = tables.length > 0;
+  const hasChart = chart?.available === true;
+
+  const tabs: { key: "sql" | "table" | "chart"; label: string; enabled: boolean }[] = [
+    { key: "sql", label: `SQL${sqlTasks.length > 1 ? ` (${sqlTasks.length})` : ""}`, enabled: hasSql },
+    { key: "table", label: `Table${tables.length > 1 ? ` (${tables.length})` : ""}`, enabled: hasTable },
+    { key: "chart", label: "Chart", enabled: hasChart },
+  ];
+
+  const currentTable = tables[selectedTableIdx];
+
+  return (
+    <div className="rounded-lg border border-border bg-surface-raised">
+      {/* Tab row */}
+      <div className="flex border-b border-border">
+        {tabs.map((t) => (
+          <button
+            key={t.key}
+            onClick={() => t.enabled && onTabChange(t.key)}
+            className={`px-4 py-2 text-xs font-medium transition-colors ${
+              activeTab === t.key && t.enabled
+                ? "border-b-2 border-accent text-white"
+                : t.enabled
+                  ? "text-neutral-500 hover:text-neutral-300"
+                  : "cursor-default text-neutral-600"
+            }`}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Tab content */}
+      <div className="p-4">
+        {activeTab === "sql" && (
+          <div className="space-y-3">
+            {hasSql ? (
+              sqlTasks.map((task, i) => (
+                <div key={i}>
+                  <p className="mb-1 text-xs font-semibold text-neutral-300">
+                    {task.title}
+                  </p>
+                  <pre className="overflow-x-auto rounded bg-surface p-3 font-mono text-xs text-neutral-300">
+                    {task.sql}
+                  </pre>
+                  {task.error && (
+                    <p className="mt-1 text-xs text-red-400">⚠ {task.error}</p>
+                  )}
+                </div>
+              ))
+            ) : (
+              <p className="text-xs text-neutral-500">No SQL available.</p>
+            )}
+          </div>
+        )}
+
+        {activeTab === "table" && (
+          <div>
+            {hasTable ? (
+              <>
+                {tables.length > 1 && (
+                  <div className="mb-3 flex gap-2">
+                    {tables.map((t, i) => (
+                      <button
+                        key={i}
+                        onClick={() => onSelectTable(i)}
+                        className={`rounded px-2 py-1 text-xs font-medium transition-colors ${
+                          i === selectedTableIdx
+                            ? "bg-accent/20 text-accent-hover"
+                            : "bg-surface-overlay text-neutral-500 hover:text-neutral-300"
+                        }`}
+                      >
+                        {t.task_title}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {currentTable && (
+                  <div>
+                    {tables.length === 1 && (
+                      <p className="mb-2 text-xs font-semibold text-neutral-300">
+                        {currentTable.task_title}
+                      </p>
+                    )}
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left text-xs">
+                        <thead>
+                          <tr className="border-b border-border">
+                            {currentTable.columns.map((col) => (
+                              <th
+                                key={col}
+                                className="px-3 py-2 font-semibold text-neutral-300"
+                              >
+                                {col}
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {currentTable.rows.map((row, ri) => (
+                            <tr key={ri} className="border-b border-border/50">
+                              {(row as unknown[]).map((cell, ci) => (
+                                <td
+                                  key={ci}
+                                  className="px-3 py-1.5 text-neutral-400"
+                                >
+                                  {String(cell)}
+                                </td>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <p className="mt-2 text-xs text-neutral-500">
+                      {currentTable.row_count} row
+                      {currentTable.row_count !== 1 ? "s" : ""}
+                      {currentTable.truncated ? " (truncated)" : ""}
+                    </p>
+                  </div>
+                )}
+              </>
+            ) : (
+              <p className="text-xs text-neutral-500">No table data available.</p>
+            )}
+          </div>
+        )}
+
+        {activeTab === "chart" && (
+          <div>
+            {hasChart ? (
+              <div className="space-y-2">
+                <p className="text-xs text-neutral-300">
+                  <span className="font-semibold">Chart type:</span>{" "}
+                  {chart!.chart_type}
+                </p>
+                {chart!.title && (
+                  <p className="text-xs text-neutral-300">
+                    <span className="font-semibold">Title:</span>{" "}
+                    {chart!.title}
+                  </p>
+                )}
+                <p className="text-xs text-neutral-300">
+                  <span className="font-semibold">X:</span> {chart!.x_column}{" "}
+                  | <span className="font-semibold">Y:</span>{" "}
+                  {chart!.y_column}
+                </p>
+                <p className="mt-2 text-xs text-neutral-500 italic">
+                  Chart rendering coming soon — spec is ready.
+                </p>
+              </div>
+            ) : (
+              <p className="text-xs text-neutral-500">No chart available.</p>
+            )}
+          </div>
         )}
       </div>
     </div>
@@ -426,7 +783,6 @@ function ProgressPanel({
           })}
         </div>
 
-        {/* Retry events */}
         {retries.length > 0 && (
           <div className="mt-2 space-y-1">
             {retries.map((r, i) => (
@@ -437,196 +793,6 @@ function ProgressPanel({
           </div>
         )}
       </div>
-    </div>
-  );
-}
-
-function ArtifactPanel({
-  artifacts,
-  activeTab,
-  onTabChange,
-  metrics,
-  selectedTableIdx,
-  onSelectTable,
-}: {
-  artifacts: Artifacts;
-  activeTab: ArtifactTab;
-  onTabChange: (tab: ArtifactTab) => void;
-  metrics: MetricsData | null;
-  selectedTableIdx: number;
-  onSelectTable: (idx: number) => void;
-}) {
-  const tabs: { key: ArtifactTab; label: string }[] = [
-    { key: "answer", label: "Answer" },
-    { key: "sql", label: `SQL${artifacts.sqlTasks.length > 1 ? ` (${artifacts.sqlTasks.length})` : ""}` },
-    { key: "table", label: `Table${artifacts.tables.length > 1 ? ` (${artifacts.tables.length})` : ""}` },
-    { key: "chart", label: "Chart" },
-  ];
-
-  const currentTable = artifacts.tables[selectedTableIdx];
-
-  return (
-    <div className="rounded-lg border border-border bg-surface-raised">
-      {/* Tab row */}
-      <div className="flex border-b border-border">
-        {tabs.map((t) => (
-          <button
-            key={t.key}
-            onClick={() => onTabChange(t.key)}
-            className={`px-4 py-2 text-xs font-medium transition-colors ${
-              activeTab === t.key
-                ? "border-b-2 border-accent text-white"
-                : "text-neutral-500 hover:text-neutral-300"
-            }`}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
-
-      {/* Tab content */}
-      <div className="p-4">
-        {activeTab === "answer" && (
-          <p className="text-xs text-neutral-400">
-            See the assistant message above.
-          </p>
-        )}
-
-        {activeTab === "sql" && (
-          <div className="space-y-3">
-            {artifacts.sqlTasks.length > 0 ? (
-              artifacts.sqlTasks.map((task, i) => (
-                <div key={i}>
-                  <p className="mb-1 text-xs font-semibold text-neutral-300">
-                    {task.title}
-                  </p>
-                  <pre className="overflow-x-auto rounded bg-surface p-3 font-mono text-xs text-neutral-300">
-                    {task.sql}
-                  </pre>
-                  {task.error && (
-                    <p className="mt-1 text-xs text-red-400">⚠ {task.error}</p>
-                  )}
-                </div>
-              ))
-            ) : (
-              <p className="text-xs text-neutral-500">No SQL generated.</p>
-            )}
-          </div>
-        )}
-
-        {activeTab === "table" && (
-          <div>
-            {artifacts.tables.length > 1 && (
-              <div className="mb-3 flex gap-2">
-                {artifacts.tables.map((t, i) => (
-                  <button
-                    key={i}
-                    onClick={() => onSelectTable(i)}
-                    className={`rounded px-2 py-1 text-xs font-medium transition-colors ${
-                      i === selectedTableIdx
-                        ? "bg-accent/20 text-accent-hover"
-                        : "bg-surface-overlay text-neutral-500 hover:text-neutral-300"
-                    }`}
-                  >
-                    {t.task_title}
-                  </button>
-                ))}
-              </div>
-            )}
-            {currentTable ? (
-              <div>
-                {artifacts.tables.length === 1 && (
-                  <p className="mb-2 text-xs font-semibold text-neutral-300">
-                    {currentTable.task_title}
-                  </p>
-                )}
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left text-xs">
-                    <thead>
-                      <tr className="border-b border-border">
-                        {currentTable.columns.map((col) => (
-                          <th
-                            key={col}
-                            className="px-3 py-2 font-semibold text-neutral-300"
-                          >
-                            {col}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {currentTable.rows.map((row, ri) => (
-                        <tr key={ri} className="border-b border-border/50">
-                          {row.map((cell, ci) => (
-                            <td
-                              key={ci}
-                              className="px-3 py-1.5 text-neutral-400"
-                            >
-                              {String(cell)}
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                <p className="mt-2 text-xs text-neutral-500">
-                  {currentTable.row_count} row{currentTable.row_count !== 1 ? "s" : ""}
-                  {currentTable.truncated ? " (truncated)" : ""}
-                </p>
-              </div>
-            ) : (
-              <p className="text-xs text-neutral-500">No table data.</p>
-            )}
-          </div>
-        )}
-
-        {activeTab === "chart" && (
-          <div>
-            {artifacts.chart?.available ? (
-              <div className="space-y-2">
-                <p className="text-xs text-neutral-300">
-                  <span className="font-semibold">Chart type:</span>{" "}
-                  {artifacts.chart.chart_type}
-                </p>
-                {artifacts.chart.title && (
-                  <p className="text-xs text-neutral-300">
-                    <span className="font-semibold">Title:</span>{" "}
-                    {artifacts.chart.title}
-                  </p>
-                )}
-                <p className="text-xs text-neutral-300">
-                  <span className="font-semibold">X:</span>{" "}
-                  {artifacts.chart.x_column} |{" "}
-                  <span className="font-semibold">Y:</span>{" "}
-                  {artifacts.chart.y_column}
-                </p>
-                <p className="mt-2 text-xs text-neutral-500 italic">
-                  Chart rendering coming soon — spec is ready.
-                </p>
-              </div>
-            ) : (
-              <p className="text-xs text-neutral-500">
-                No chart available for this query.
-              </p>
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* Metrics footer */}
-      {metrics && (
-        <div className="flex gap-4 border-t border-border px-4 py-2 text-[10px] text-neutral-500">
-          <span>Total: {metrics.total_ms}ms</span>
-          <span>LLM: {metrics.llm_ms}ms</span>
-          <span>DB: {metrics.db_ms}ms</span>
-          <span>Rows: {metrics.rows_returned}</span>
-          <span>Tokens: {metrics.tokens_streamed}</span>
-          {metrics.retries_used > 0 && (
-            <span className="text-amber-500">Retries: {metrics.retries_used}</span>
-          )}
-        </div>
-      )}
     </div>
   );
 }
