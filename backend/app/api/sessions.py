@@ -40,6 +40,7 @@ from app.services.memory import (
 )
 from app.agent.workflow import run_workflow
 from app.core.logging import get_logger
+from app.services.observability import get_tracer
 
 logger = get_logger(__name__)
 
@@ -169,11 +170,23 @@ async def chat(body: ChatRequest, user: dict[str, Any] = Depends(require_auth)):
     async def _noop_emit(event: str, data: dict) -> None:
         pass
 
+    # ── Start Langfuse trace ──────────────────────────────
+    tracer = get_tracer()
+    trace = tracer.start_trace(
+        name="chat.sync",
+        request_id=request_id,
+        user_id=user_id,
+        session_id=session_id,
+        metadata={"mode": "sync", "client": "web", "streaming": False},
+    )
+
     # Run the full workflow
     t0 = time.perf_counter()
     try:
-        state = await run_workflow(body.message, history, _noop_emit, memory_bundle=memory_bundle)
+        state = await run_workflow(body.message, history, _noop_emit, memory_bundle=memory_bundle, tracer=tracer, trace=trace)
     except Exception as exc:
+        tracer.finalize_trace(trace, level="ERROR", status_message=str(exc)[:200])
+        tracer.flush()
         if audit_id:
             try:
                 await finalize_audit_error(audit_id, error_message=str(exc))
@@ -213,6 +226,16 @@ async def chat(body: ChatRequest, user: dict[str, Any] = Depends(require_auth)):
         "db_ms": state.db_ms,
         "rows_returned": state.rows_returned,
     }
+    # Include Langfuse trace link if available
+    _tid = getattr(trace, 'trace_id', '') or getattr(trace, 'id', '') or ''
+    if _tid:
+        metrics_data["langfuse_trace_id"] = _tid
+        try:
+            _turl = trace.get_trace_url()
+            if _turl:
+                metrics_data["langfuse_url"] = _turl
+        except Exception:
+            pass
 
     await add_message(
         session_id, "assistant", state.answer_text,
@@ -276,6 +299,10 @@ async def chat(body: ChatRequest, user: dict[str, Any] = Depends(require_auth)):
             )
         except Exception:
             logger.warning("Audit finalize (success) failed", exc_info=True)
+
+    # Finalize Langfuse trace
+    tracer.finalize_trace(trace, output={"total_ms": total_ms, "ok": True})
+    tracer.flush()
 
     # Return full message history
     messages = await list_messages(user_id, session_id)

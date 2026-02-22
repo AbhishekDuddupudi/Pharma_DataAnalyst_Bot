@@ -47,6 +47,7 @@ from app.services.memory import (
 )
 from app.agent.workflow import run_workflow
 from app.core.logging import get_logger
+from app.services.observability import get_tracer
 
 logger = get_logger(__name__)
 
@@ -111,6 +112,16 @@ async def _generate_stream(
 
         yield _sse("session", {"session_id": session_id})
 
+        # ── Start Langfuse trace ──────────────────────────────
+        tracer = get_tracer()
+        trace = tracer.start_trace(
+            name="chat.stream",
+            request_id=request_id,
+            user_id=user_id,
+            session_id=session_id,
+            metadata={"mode": "stream", "client": "web", "streaming": True},
+        )
+
         # ── Store user message ────────────────────────────────
         await add_message(session_id, "user", body.message)
         await maybe_auto_title(session_id)
@@ -148,7 +159,7 @@ async def _generate_stream(
         async def _run_workflow():
             nonlocal workflow_state, workflow_error
             try:
-                workflow_state = await run_workflow(body.message, history, emit, memory_bundle=memory_bundle)
+                workflow_state = await run_workflow(body.message, history, emit, memory_bundle=memory_bundle, tracer=tracer, trace=trace)
             except Exception as exc:
                 workflow_error = str(exc)
                 logger.exception("Workflow error for user %s", user_id)
@@ -186,6 +197,8 @@ async def _generate_stream(
         # ── Handle error from workflow ────────────────────────
         if workflow_error:
             yield _sse("error", {"message": workflow_error})
+            tracer.finalize_trace(trace, level="ERROR", status_message=workflow_error[:200])
+            tracer.flush()
             if audit_id:
                 try:
                     await finalize_audit_error(
@@ -197,6 +210,9 @@ async def _generate_stream(
             return
 
         if cancelled:
+            tracer.log_event(trace, name="stream.cancelled", level="WARNING")
+            tracer.finalize_trace(trace, level="WARNING", status_message="Client disconnected")
+            tracer.flush()
             return
 
         # ── Emit metrics ──────────────────────────────────────
@@ -208,6 +224,15 @@ async def _generate_stream(
                 "db_ms": workflow_state.db_ms,
             }
 
+            # Build trace link if available
+            trace_id = getattr(trace, 'trace_id', '') or getattr(trace, 'id', '') or ''
+            trace_url = ''
+            if hasattr(trace, 'get_trace_url'):
+                try:
+                    trace_url = trace.get_trace_url()
+                except Exception:
+                    pass
+
             yield _sse("metrics", {
                 "total_ms": total_ms,
                 "llm_ms": workflow_state.llm_ms,
@@ -215,6 +240,10 @@ async def _generate_stream(
                 "rows_returned": workflow_state.rows_returned,
                 "tokens_streamed": workflow_state.tokens_streamed,
                 "retries_used": workflow_state.retries_used,
+                **({
+                    "langfuse_trace_id": trace_id,
+                    "langfuse_url": trace_url,
+                } if trace_id else {}),
             })
 
             # ── Emit audit event ──────────────────────────────
@@ -257,6 +286,11 @@ async def _generate_stream(
                 "db_ms": workflow_state.db_ms,
                 "rows_returned": workflow_state.rows_returned,
             }
+            # Include Langfuse trace link if available
+            if trace_id:
+                metrics_data["langfuse_trace_id"] = trace_id
+            if trace_url:
+                metrics_data["langfuse_url"] = trace_url
 
             await add_message(
                 session_id,
@@ -355,9 +389,21 @@ async def _generate_stream(
                 complete_data["reason"] = workflow_state.reject_reason
         yield _sse("complete", complete_data)
 
+        # ── Finalize Langfuse trace ───────────────────────────
+        tracer.finalize_trace(trace, output={
+            "ok": complete_data.get("ok", False),
+            "total_ms": timings_ms.get("total_ms") if workflow_state else None,
+        })
+        tracer.flush()
+
     except Exception as exc:
         logger.exception("Streaming error for user %s", user_id)
         yield _sse("error", {"message": str(exc)})
+        try:
+            tracer.finalize_trace(trace, level="ERROR", status_message=str(exc)[:200])
+            tracer.flush()
+        except Exception:
+            pass
 
 
 # ── Endpoint ─────────────────────────────────────────────────────

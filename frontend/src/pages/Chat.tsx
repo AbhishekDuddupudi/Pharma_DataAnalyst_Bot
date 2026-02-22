@@ -500,6 +500,18 @@ function AssistantBlock({
             {m.metrics_json.rows_returned != null && (
               <span>Rows: {m.metrics_json.rows_returned}</span>
             )}
+            {(m.metrics_json as Record<string, unknown>).langfuse_url ? (
+              <a
+                href={(m.metrics_json as Record<string, unknown>).langfuse_url as string}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline hover:text-indigo-500"
+              >
+                View Trace &rarr;
+              </a>
+            ) : (m.metrics_json as Record<string, unknown>).langfuse_trace_id ? (
+              <span>Trace: {String((m.metrics_json as Record<string, unknown>).langfuse_trace_id).slice(0, 8)}</span>
+            ) : null}
           </div>
         )}
       </div>

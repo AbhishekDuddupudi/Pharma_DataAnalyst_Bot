@@ -19,6 +19,7 @@ import asyncpg
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.security.sql_policy import validate_sql
+from app.services.observability import get_tracer
 
 logger = get_logger(__name__)
 
@@ -39,13 +40,15 @@ async def _get_conn() -> asyncpg.Connection:
     return await asyncpg.connect(dsn)
 
 
-async def execute_query(sql: str) -> QueryResult:
+async def execute_query(sql: str, *, parent_span: Any = None) -> QueryResult:
     """
     Execute a read-only SQL query and return structured results.
 
     Raises:
         ValueError – if the SQL fails policy validation.
         RuntimeError – if the DB query itself errors.
+
+    If *parent_span* is provided, a Langfuse span is logged for this query.
     """
     # Double-check policy before execution
     validation = validate_sql(sql)
@@ -85,13 +88,25 @@ async def execute_query(sql: str) -> QueryResult:
         for r in result_rows:
             plain_rows.append([_serialise(r[col]) for col in columns])
 
-        return QueryResult(
+        qr = QueryResult(
             columns=columns,
             rows=plain_rows,
             row_count=len(plain_rows),
             truncated=truncated,
             db_ms=db_ms,
         )
+
+        # ── Langfuse db.query span ────────────────────────
+        if parent_span is not None:
+            tracer = get_tracer()
+            span = tracer.start_span(parent_span, name="db.query", input={"sql": clean_sql[:2000]})
+            tracer.end_span(span, output={
+                "row_count": qr.row_count,
+                "columns": qr.columns,
+                "truncated": qr.truncated,
+            }, metadata={"db_ms": db_ms})
+
+        return qr
 
     except asyncpg.PostgresError as exc:
         logger.error("SQL execution error: %s | SQL: %s", exc, clean_sql[:200])

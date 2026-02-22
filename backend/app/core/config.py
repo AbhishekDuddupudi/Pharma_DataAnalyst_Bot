@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     SQL_MAX_RETRIES: int = 2
     SQL_MAX_ROWS: int = 100
 
+    # ── Langfuse Observability ─────────────────────────────────
+    LANGFUSE_ENABLED: bool = False
+    LANGFUSE_PUBLIC_KEY: str = ""
+    LANGFUSE_SECRET_KEY: str = ""
+    LANGFUSE_HOST: str = "https://cloud.langfuse.com"
+
     # ── Helpers ───────────────────────────────────────────────────
     @property
     def cors_origins_list(self) -> list[str]:

@@ -312,7 +312,7 @@ LANGFUSE_HOST=https://cloud.langfuse.com
 
 After each query, the frontend displays a "View Trace →" link in the metrics footer (bottom of assistant message). Click it to open the trace in Langfuse's cloud UI.
 
-The `trace_id` is also stored in the `audit_log` table for cross-referencing.
+The `trace_id` and trace URL are also persisted in the `metrics_json` column of each assistant message for historical access.
 
 ### Disabling Tracing
 

@@ -31,6 +31,7 @@ from app.core.logging import get_logger
 from app.security.sql_policy import validate_sql, get_allowlist_summary
 from app.services.llm import call_llm_json, stream_llm_tokens
 from app.services.sql_executor import execute_query, QueryResult
+from app.services.observability import get_tracer
 
 logger = get_logger(__name__)
 
@@ -154,6 +155,9 @@ class WorkflowState:
     metrics_used: list[str] = field(default_factory=list)
     assumptions: list[str] = field(default_factory=list)
     follow_ups: list[str] = field(default_factory=list)
+    # Observability — Langfuse tracer + trace (may be NoOp)
+    tracer: Any = None
+    trace: Any = None
 
 
 # ── Schema loader ────────────────────────────────────────────────
@@ -258,6 +262,7 @@ def _format_memory_context(bundle: dict) -> str:
 async def _preprocess_input(state: WorkflowState, emit: Emitter) -> None:
     """Node 1: normalise, strip noise, detect mode."""
     await emit("status", {"step": "preprocess_input", "message": "Preprocessing your question…"})
+    span = state.tracer.start_span(state.trace, name="preprocess_input", input={"message": state.user_message[:500]})
 
     msg = state.user_message.strip()
     lower = msg.lower()
@@ -270,6 +275,7 @@ async def _preprocess_input(state: WorkflowState, emit: Emitter) -> None:
 
     state.preprocessed = msg
     logger.info("Preprocess: mode=%s", state.mode)
+    state.tracer.end_span(span, output={"mode": state.mode, "preprocessed_len": len(msg)})
 
 
 async def _scope_policy_check(state: WorkflowState, emit: Emitter) -> None:
@@ -281,6 +287,8 @@ async def _scope_policy_check(state: WorkflowState, emit: Emitter) -> None:
     3. Greetings / small-talk about the bot → allow.
     4. Ambiguous → fall back to LLM scope check.
     """
+    span = state.tracer.start_span(state.trace, name="scope_policy_check", input={"preprocessed": state.preprocessed[:300]})
+    scope_result = "unknown"
     lower = state.preprocessed.lower()
     words = set(re.findall(r"[a-z]+", lower))
 
@@ -295,6 +303,7 @@ async def _scope_policy_check(state: WorkflowState, emit: Emitter) -> None:
                 "message": "Blocked (rules) — off-topic request",
             })
             logger.info("Scope BLOCKED by rules: %s", state.preprocessed[:80])
+            state.tracer.end_span(span, output={"result": "blocked_rules"}, level="WARNING")
             return
 
     # ── Step B: follow-up with existing intent → allow ─────
@@ -311,6 +320,7 @@ async def _scope_policy_check(state: WorkflowState, emit: Emitter) -> None:
             "message": "Allowed (rules) — follow-up on previous analysis",
         })
         logger.info("Scope ALLOWED by rules: follow-up detected (intent exists)")
+        state.tracer.end_span(span, output={"result": "allowed_followup"})
         return
 
     # ── Step C: greetings / small-talk about the bot → allow ─
@@ -322,6 +332,7 @@ async def _scope_policy_check(state: WorkflowState, emit: Emitter) -> None:
             "message": "Allowed (rules) — greeting / help",
         })
         logger.info("Scope ALLOWED by rules: greeting")
+        state.tracer.end_span(span, output={"result": "allowed_greeting"})
         return
 
     # ── Step D: analytics domain match → allow ───────────────
@@ -374,6 +385,7 @@ async def _scope_policy_check(state: WorkflowState, emit: Emitter) -> None:
                     "message": "Need clarification — question is too vague",
                 })
                 logger.info("Scope CLARIFICATION needed: missing=%s", missing)
+                state.tracer.end_span(span, output={"result": "needs_clarification", "missing": missing})
                 return
 
         await emit("status", {
@@ -381,6 +393,7 @@ async def _scope_policy_check(state: WorkflowState, emit: Emitter) -> None:
             "message": "Allowed (rules) — analytics question detected",
         })
         logger.info("Scope ALLOWED by rules: domains=%s", domain_overlap)
+        state.tracer.end_span(span, output={"result": "allowed_domain", "domains": list(domain_overlap)[:10]})
         return
 
     # ── Step E: ambiguous → LLM fallback ─────────────────────
@@ -405,7 +418,7 @@ async def _scope_policy_check(state: WorkflowState, emit: Emitter) -> None:
     if summary:
         user_text = f"Session context: {summary[:300]}\n\nUser message: {state.preprocessed}"
 
-    resp = await call_llm_json(system, user_text)
+    resp = await call_llm_json(system, user_text, parent_span=span)
     state.llm_ms += resp["llm_ms"]
     result = resp["result"]
 
@@ -417,11 +430,13 @@ async def _scope_policy_check(state: WorkflowState, emit: Emitter) -> None:
             "message": f"Blocked (LLM) — {state.reject_reason[:60]}",
         })
         logger.info("Scope REJECTED by LLM: %s", state.reject_reason)
+        state.tracer.end_span(span, output={"result": "rejected_llm", "reason": state.reject_reason[:100]}, level="WARNING")
     else:
         await emit("status", {
             "step": "scope_policy_check",
             "message": "Allowed (LLM)",
         })
+        state.tracer.end_span(span, output={"result": "allowed_llm"})
 
 
 async def _semantic_grounding(state: WorkflowState, emit: Emitter) -> None:
@@ -479,7 +494,7 @@ async def _analysis_planner(state: WorkflowState, emit: Emitter) -> None:
 async def _sql_generator(state: WorkflowState, emit: Emitter) -> None:
     """Node 5: generate SQL for each task."""
     await emit("status", {"step": "sql_generator", "message": "Generating SQL…"})
-
+    span = state.tracer.start_span(state.trace, name="sql_generator", input={"tasks_count": len(state.tasks)})
     schema_text = _schema_summary()
     policy = get_allowlist_summary()
 
@@ -517,25 +532,35 @@ async def _sql_generator(state: WorkflowState, emit: Emitter) -> None:
 
         user_prompt = f"Task: {task.title}\nUser question: {state.preprocessed}"
 
-        resp = await call_llm_json(system, user_prompt)
+        # Per-task sub-span for SQL generation
+        task_span = state.tracer.start_span(span, name=f"sql_gen.{task.title[:40]}", input={"task": task.title})
+        resp = await call_llm_json(system, user_prompt, parent_span=task_span)
         state.llm_ms += resp["llm_ms"]
         task.sql = resp["result"].get("sql", "").strip()
         task.original_sql = task.sql
         logger.info("SQL generated for '%s': %s", task.title, task.sql[:100])
+        state.tracer.end_span(task_span, output={"sql_chars": len(task.sql)})
+
+    state.tracer.end_span(span, output={"tasks_generated": len(state.tasks)})
 
 
 async def _sql_validator(state: WorkflowState, emit: Emitter) -> None:
     """Node 6: validate generated SQL."""
     await emit("status", {"step": "sql_validator", "message": "Validating SQL…"})
+    span = state.tracer.start_span(state.trace, name="sql_validator", input={"tasks_count": len(state.tasks)})
 
+    invalid_count = 0
     for task in state.tasks:
         result = validate_sql(task.sql)
         task.valid = result.valid
         if not result.valid:
             task.error = "; ".join(result.errors)
+            invalid_count += 1
             logger.warning("Validation failed for '%s': %s", task.title, task.error)
         else:
             task.error = None
+
+    state.tracer.end_span(span, output={"invalid_count": invalid_count})
 
 
 async def _sql_repair(state: WorkflowState, emit: Emitter) -> None:
@@ -544,8 +569,10 @@ async def _sql_repair(state: WorkflowState, emit: Emitter) -> None:
     if not needs_repair:
         return
 
+    span = state.tracer.start_span(state.trace, name="sql_repair", input={"tasks_needing_repair": len(needs_repair)})
     schema_text = _schema_summary()
     policy = get_allowlist_summary()
+    total_retries = 0
 
     for task in needs_repair:
         for attempt in range(settings.SQL_MAX_RETRIES):
@@ -574,7 +601,7 @@ async def _sql_repair(state: WorkflowState, emit: Emitter) -> None:
                 "Fix ONLY the errors. Keep the query intent the same."
             )
 
-            resp = await call_llm_json(system, f"Fix this SQL for: {task.title}")
+            resp = await call_llm_json(system, f"Fix this SQL for: {task.title}", parent_span=span)
             state.llm_ms += resp["llm_ms"]
             task.sql = resp["result"].get("sql", task.sql).strip()
 
@@ -583,10 +610,14 @@ async def _sql_repair(state: WorkflowState, emit: Emitter) -> None:
             if result.valid:
                 task.error = None
                 logger.info("SQL repaired for '%s' on attempt %d", task.title, attempt + 1)
+                total_retries += 1
                 break
             else:
                 task.error = "; ".join(result.errors)
+                total_retries += 1
                 logger.warning("Repair attempt %d failed for '%s': %s", attempt + 1, task.title, task.error)
+
+    state.tracer.end_span(span, output={"total_retries": total_retries, "still_invalid": sum(1 for t in needs_repair if not t.valid)})
 
 
 async def _sql_executor_node(state: WorkflowState, emit: Emitter) -> None:
@@ -598,6 +629,7 @@ async def _sql_executor_node(state: WorkflowState, emit: Emitter) -> None:
     Emits artifact_sql (with final SQL) then artifact_table per successful task.
     """
     await emit("status", {"step": "sql_executor", "message": "Running queries…"})
+    span = state.tracer.start_span(state.trace, name="sql_executor", input={"tasks_count": len(state.tasks)})
 
     schema_text = _schema_summary()
     policy = get_allowlist_summary()
@@ -611,7 +643,7 @@ async def _sql_executor_node(state: WorkflowState, emit: Emitter) -> None:
         max_attempts = settings.SQL_MAX_RETRIES + 1
         for attempt in range(max_attempts):
             try:
-                result = await execute_query(task.sql)
+                result = await execute_query(task.sql, parent_span=span)
                 task.result = result
                 task.error = None
                 state.db_ms += result.db_ms
@@ -654,7 +686,7 @@ async def _sql_executor_node(state: WorkflowState, emit: Emitter) -> None:
                         "Return JSON: {{\"sql\": \"SELECT ...\"}}\n"
                         "Fix the error. Keep the query intent the same."
                     )
-                    resp = await call_llm_json(repair_system, f"Fix SQL for: {task.title}")
+                    resp = await call_llm_json(repair_system, f"Fix SQL for: {task.title}", parent_span=span)
                     state.llm_ms += resp["llm_ms"]
                     task.sql = resp["result"].get("sql", task.sql).strip()
 
@@ -686,6 +718,8 @@ async def _sql_executor_node(state: WorkflowState, emit: Emitter) -> None:
                 "row_count": task.result.row_count,
                 "truncated": task.result.truncated,
             })
+
+    state.tracer.end_span(span, output={"db_ms": state.db_ms, "rows_returned": state.rows_returned})
 
 
 async def _viz_builder(state: WorkflowState, emit: Emitter) -> None:
@@ -740,7 +774,7 @@ def _strip_markdown(text: str) -> str:
 async def _response_synthesizer(state: WorkflowState, emit: Emitter) -> None:
     """Node 10: produce a structured answer with assumptions + follow-ups."""
     await emit("status", {"step": "response_synthesizer", "message": "Writing answer…"})
-
+    span = state.tracer.start_span(state.trace, name="response_synthesizer")
     # Build context from all task results
     results_text_parts: list[str] = []
     for task in state.tasks:
@@ -786,7 +820,7 @@ async def _response_synthesizer(state: WorkflowState, emit: Emitter) -> None:
 
     user_prompt = f"User question: {state.preprocessed}\n\nQuery results:\n{results_text}"
 
-    resp = await call_llm_json(system, user_prompt)
+    resp = await call_llm_json(system, user_prompt, parent_span=span)
     state.llm_ms += resp["llm_ms"]
     result = resp["result"]
 
@@ -809,6 +843,7 @@ async def _response_synthesizer(state: WorkflowState, emit: Emitter) -> None:
         state.tokens_streamed += 1
 
     state.answer_text = answer
+    state.tracer.end_span(span, output={"answer_len": len(answer), "tokens_streamed": state.tokens_streamed})
 
 
 # ── Main orchestrator ────────────────────────────────────────────
@@ -819,6 +854,9 @@ async def run_workflow(
     history: list[dict],
     emit: Emitter,
     memory_bundle: dict | None = None,
+    *,
+    tracer: Any = None,
+    trace: Any = None,
 ) -> WorkflowState:
     """
     Execute the full 10-node workflow.
@@ -828,14 +866,25 @@ async def run_workflow(
         history – recent conversation history [{role, content}, …].
         emit – async callback ``(event_type, data_dict) -> None``.
         memory_bundle – 4-layer memory dict from memory service (optional).
+        tracer – observability tracer (Langfuse or NoOp).
+        trace – Langfuse trace for this request (or NoOp).
 
     Returns the final WorkflowState with all results.
     """
+    # Fall back to NoOp tracer/trace if not provided
+    if tracer is None:
+        tracer = get_tracer()
+    if trace is None:
+        from app.services.observability import _NoOpTrace
+        trace = _NoOpTrace()
+
     state = WorkflowState(
         user_message=user_message,
         history=history,
         memory_bundle=memory_bundle or {},
         total_t0=time.perf_counter(),
+        tracer=tracer,
+        trace=trace,
     )
 
     # ── Node 1: preprocess ────────────────────────────────────
