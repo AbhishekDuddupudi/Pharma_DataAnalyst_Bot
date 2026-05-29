@@ -1,9 +1,17 @@
 """
-Langfuse tracing wrapper – no-op friendly.
+Langfuse tracing wrapper – no-op friendly (Langfuse SDK v4).
 
 If ``LANGFUSE_ENABLED`` is false or keys are missing, every method
 silently does nothing (``NoOpTracer``).  When enabled the real
-``LangfuseTracer`` creates traces + spans on the Langfuse backend.
+``LangfuseTracer`` uses the Langfuse v4 SDK (``Langfuse()`` client with
+``start_observation()`` / ``update()`` / ``end()``).
+
+Trace hierarchy (one per chat request)::
+
+    root span  ← start_trace()          → _SpanHandle (wraps LangfuseSpan)
+      child span ← start_span()         → _SpanHandle
+        generation ← log_generation()  → LangfuseGeneration (ended inline)
+        event      ← log_event()       → LangfuseEvent (ended inline)
 
 Safety: We never send cookies, passwords, API keys, or full DB result
 rows.  Only SQL text, row counts, timings, selected tables/columns,
@@ -12,7 +20,6 @@ node names, retry counts, and sanitised error messages.
 
 from __future__ import annotations
 
-import time
 from typing import Any
 
 from app.core.config import settings
@@ -155,16 +162,48 @@ class NoOpTracer:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Real Langfuse tracer
+# _SpanHandle – thin wrapper that adds get_trace_url() to a v4 span
+# ═══════════════════════════════════════════════════════════════════
+
+
+class _SpanHandle:
+    """
+    Wraps a ``LangfuseSpan`` / ``LangfuseGeneration`` from the v4 SDK and
+    surfaces the helpers that the rest of the code-base expects:
+    ``trace_id`` and ``get_trace_url()``.
+    """
+
+    __slots__ = ("_span", "_client")
+
+    def __init__(self, span: Any, client: Any) -> None:
+        self._span = span
+        self._client = client
+
+    @property
+    def trace_id(self) -> str:
+        return str(getattr(self._span, "trace_id", "") or "")
+
+    def get_trace_url(self) -> str:
+        tid = self.trace_id
+        return self._client.get_trace_url(trace_id=tid) or "" if tid else ""
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Real Langfuse tracer (SDK v4)
 # ═══════════════════════════════════════════════════════════════════
 
 
 class LangfuseTracer:
     """
-    Thin wrapper around the Langfuse Python SDK.
+    Thin wrapper around the Langfuse Python SDK v4.
 
-    Each ``start_trace`` call creates a Langfuse trace.  Spans and
-    generations are children of that trace (or of other spans).
+    Uses ``Langfuse()`` directly (explicit credentials) so the existing
+    ``LANGFUSE_HOST`` config key is honoured without renaming to the v4
+    default env-var ``LANGFUSE_BASE_URL``.
+
+    Each ``start_trace()`` creates a root ``LangfuseSpan`` (the v4 concept
+    of a trace *is* the root span).  Child spans and generations are
+    created on their parent via ``parent.start_observation()``.
     """
 
     def __init__(self) -> None:
@@ -175,9 +214,17 @@ class LangfuseTracer:
             secret_key=settings.LANGFUSE_SECRET_KEY,
             host=settings.LANGFUSE_HOST,
         )
-        logger.info("Langfuse tracer initialised (host=%s)", settings.LANGFUSE_HOST)
+        logger.info(
+            "Langfuse v4 tracer initialised (host=%s)", settings.LANGFUSE_HOST
+        )
 
-    # ── trace lifecycle ──────────────────────────────────────
+    # ── helpers ─────────────────────────────────────────────────
+
+    def _unwrap(self, handle: Any) -> Any:
+        """Return the underlying v4 span from a _SpanHandle (or pass-through)."""
+        return handle._span if isinstance(handle, _SpanHandle) else handle
+
+    # ── trace lifecycle ──────────────────────────────────────────
 
     def start_trace(
         self,
@@ -187,17 +234,31 @@ class LangfuseTracer:
         user_id: int | str,
         session_id: int | str | None = None,
         metadata: dict | None = None,
-    ) -> Any:
-        """Create a new Langfuse trace for this request."""
-        return self._lf.trace(
-            id=request_id,                        # use our request_id as trace id
+    ) -> _SpanHandle:
+        """
+        Create a root span that represents the entire request trace.
+
+        A deterministic trace ID is derived from ``request_id`` so that
+        external logs and the Langfuse UI can be correlated.
+        """
+        # Seed-based ID so request_id <-> Langfuse trace are always aligned
+        trace_id = self._lf.create_trace_id(seed=request_id)
+
+        root = self._lf.start_observation(
+            as_type="span",
             name=name,
+            trace_context={"trace_id": trace_id},
+            input=_sanitise(metadata),
+        )
+        # Propagate user/session to all child observations via trace attributes
+        root.update(
             user_id=str(user_id),
             session_id=str(session_id) if session_id else None,
-            metadata=_sanitise(metadata),
+            trace_name=name,
         )
+        return _SpanHandle(root, client=self._lf)
 
-    # ── spans (workflow nodes / DB calls) ────────────────────
+    # ── child spans ──────────────────────────────────────────────
 
     def start_span(
         self,
@@ -206,13 +267,16 @@ class LangfuseTracer:
         name: str,
         input: dict | str | None = None,
         metadata: dict | None = None,
-    ) -> Any:
+    ) -> _SpanHandle:
         """Open a child span on a trace or another span."""
-        return trace.span(
+        parent = self._unwrap(trace)
+        child = parent.start_observation(
+            as_type="span",
             name=name,
             input=_sanitise(input) if isinstance(input, dict) else input,
             metadata=_sanitise(metadata),
         )
+        return _SpanHandle(child, client=self._lf)
 
     def end_span(
         self,
@@ -224,6 +288,7 @@ class LangfuseTracer:
         status_message: str | None = None,
     ) -> None:
         """Close a span with optional output and metadata."""
+        raw = self._unwrap(span)
         kw: dict[str, Any] = {}
         if output is not None:
             kw["output"] = _sanitise(output) if isinstance(output, dict) else output
@@ -233,9 +298,11 @@ class LangfuseTracer:
             kw["level"] = level
         if status_message:
             kw["status_message"] = status_message
-        span.end(**kw)
+        if kw:
+            raw.update(**kw)
+        raw.end()
 
-    # ── LLM generation spans ─────────────────────────────────
+    # ── LLM generation spans ─────────────────────────────────────
 
     def log_generation(
         self,
@@ -250,22 +317,29 @@ class LangfuseTracer:
         level: str | None = None,
     ) -> Any:
         """Record an LLM generation as a child of the given trace/span."""
-        kw: dict[str, Any] = {"name": name}
-        if model:
-            kw["model"] = model
-        if input is not None:
-            kw["input"] = input if isinstance(input, str) else _sanitise(input)
-        if output is not None:
-            kw["output"] = output if isinstance(output, str) else _sanitise(output)
-        if usage:
-            kw["usage"] = usage
-        if metadata:
-            kw["metadata"] = _sanitise(metadata)
-        if level:
-            kw["level"] = level
-        return trace_or_span.generation(**kw)
+        parent = self._unwrap(trace_or_span)
 
-    # ── one-shot events (retries, cancellations, etc.) ───────
+        gen = parent.start_observation(
+            as_type="generation",
+            name=name,
+            model=model,
+            input=input if isinstance(input, str) else _sanitise(input),
+            output=output if isinstance(output, str) else _sanitise(output),
+            metadata=_sanitise(metadata),
+        )
+        if usage:
+            gen.update(
+                usage_details={
+                    "input": usage.get("input", 0),
+                    "output": usage.get("output", 0),
+                }
+            )
+        if level:
+            gen.update(level=level)
+        gen.end()
+        return gen
+
+    # ── one-shot events ───────────────────────────────────────────
 
     def log_event(
         self,
@@ -275,15 +349,19 @@ class LangfuseTracer:
         metadata: dict | None = None,
         level: str | None = None,
     ) -> None:
-        """Log a discrete event on a trace or span."""
-        kw: dict[str, Any] = {"name": name}
+        """Log a discrete point-in-time event on a trace or span."""
+        parent = self._unwrap(trace_or_span)
+        ev = parent.start_observation(as_type="event", name=name)
+        kw: dict[str, Any] = {}
         if metadata:
             kw["metadata"] = _sanitise(metadata)
         if level:
             kw["level"] = level
-        trace_or_span.event(**kw)
+        if kw:
+            ev.update(**kw)
+        ev.end()
 
-    # ── finalize trace ───────────────────────────────────────
+    # ── finalize root trace ───────────────────────────────────────
 
     def finalize_trace(
         self,
@@ -294,7 +372,8 @@ class LangfuseTracer:
         level: str | None = None,
         status_message: str | None = None,
     ) -> None:
-        """Update the trace with final output / metrics and flush."""
+        """Update the root span with final output / metrics and end it."""
+        raw = self._unwrap(trace)
         kw: dict[str, Any] = {}
         if output is not None:
             kw["output"] = _sanitise(output) if isinstance(output, dict) else output
@@ -304,7 +383,9 @@ class LangfuseTracer:
             kw["level"] = level
         if status_message:
             kw["status_message"] = status_message
-        trace.update(**kw)
+        if kw:
+            raw.update(**kw)
+        raw.end()
 
     def flush(self) -> None:
         """Flush pending events to Langfuse (call before process exit)."""
@@ -347,3 +428,25 @@ def get_tracer() -> NoOpTracer | LangfuseTracer:
         _tracer_instance = NoOpTracer()
 
     return _tracer_instance
+
+
+def shutdown_tracer() -> None:
+    """
+    Gracefully shut down the Langfuse client.
+
+    Flushes all buffered spans and terminates background threads.
+    Call this from the FastAPI ``lifespan`` shutdown handler to avoid
+    losing the last traces when the process exits.
+    """
+    global _tracer_instance
+    if isinstance(_tracer_instance, LangfuseTracer):
+        try:
+            _tracer_instance._lf.shutdown()
+            logger.info("Langfuse client shut down cleanly")
+        except Exception:
+            logger.warning("Langfuse shutdown failed", exc_info=True)
+
+
+def flush_langfuse() -> None:
+    """Convenience wrapper — flush the singleton tracer's pending events."""
+    get_tracer().flush()

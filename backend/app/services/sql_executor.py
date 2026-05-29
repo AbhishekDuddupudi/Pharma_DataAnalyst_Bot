@@ -12,14 +12,14 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any  # noqa: F401 – used in QueryResult field types
 
 import asyncpg
 
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.security.sql_policy import validate_sql
-from app.services.observability import get_tracer
+from langfuse import get_client as _langfuse_get_client
 
 logger = get_logger(__name__)
 
@@ -40,7 +40,7 @@ async def _get_conn() -> asyncpg.Connection:
     return await asyncpg.connect(dsn)
 
 
-async def execute_query(sql: str, *, parent_span: Any = None) -> QueryResult:
+async def execute_query(sql: str) -> QueryResult:
     """
     Execute a read-only SQL query and return structured results.
 
@@ -48,7 +48,8 @@ async def execute_query(sql: str, *, parent_span: Any = None) -> QueryResult:
         ValueError – if the SQL fails policy validation.
         RuntimeError – if the DB query itself errors.
 
-    If *parent_span* is provided, a Langfuse span is logged for this query.
+    A Langfuse ``db.query`` span is automatically created as a child of
+    the currently active observation (no-op when tracing is disabled).
     """
     # Double-check policy before execution
     validation = validate_sql(sql)
@@ -68,44 +69,48 @@ async def execute_query(sql: str, *, parent_span: Any = None) -> QueryResult:
 
     conn = await _get_conn()
     try:
-        t0 = time.perf_counter()
+        lf = _langfuse_get_client()
+        with lf.start_as_current_observation(
+            as_type="span",
+            name="db.query",
+        ) as db_span:
+            db_span.update(input={"sql": clean_sql[:2_000]})
 
-        # Use a read-only transaction
-        async with conn.transaction(readonly=True):
-            rows = await conn.fetch(limited_sql)
+            t0 = time.perf_counter()
 
-        db_ms = round((time.perf_counter() - t0) * 1000)
+            # Use a read-only transaction
+            async with conn.transaction(readonly=True):
+                rows = await conn.fetch(limited_sql)
 
-        if not rows:
-            return QueryResult(columns=[], rows=[], row_count=0, db_ms=db_ms)
+            db_ms = round((time.perf_counter() - t0) * 1000)
 
-        columns = list(rows[0].keys())
-        truncated = len(rows) > max_rows
-        result_rows = rows[:max_rows]
+            if not rows:
+                db_span.update(
+                    output={"row_count": 0},
+                    metadata={"db_ms": db_ms},
+                )
+                return QueryResult(columns=[], rows=[], row_count=0, db_ms=db_ms)
 
-        # Convert asyncpg Records to plain lists (JSON-safe)
-        plain_rows: list[list[Any]] = []
-        for r in result_rows:
-            plain_rows.append([_serialise(r[col]) for col in columns])
+            columns = list(rows[0].keys())
+            truncated = len(rows) > max_rows
+            result_rows = rows[:max_rows]
 
-        qr = QueryResult(
-            columns=columns,
-            rows=plain_rows,
-            row_count=len(plain_rows),
-            truncated=truncated,
-            db_ms=db_ms,
-        )
+            # Convert asyncpg Records to plain lists (JSON-safe)
+            plain_rows: list[list[Any]] = []
+            for r in result_rows:
+                plain_rows.append([_serialise(r[col]) for col in columns])
 
-        # ── Langfuse db.query span ────────────────────────
-        if parent_span is not None:
-            tracer = get_tracer()
-            span = tracer.start_span(parent_span, name="db.query", input={"sql": clean_sql[:2000]})
-            tracer.end_span(span, output={
-                "row_count": qr.row_count,
-                "columns": qr.columns,
-                "truncated": qr.truncated,
-            }, metadata={"db_ms": db_ms})
-
+            qr = QueryResult(
+                columns=columns,
+                rows=plain_rows,
+                row_count=len(plain_rows),
+                truncated=truncated,
+                db_ms=db_ms,
+            )
+            db_span.update(
+                output={"row_count": qr.row_count, "columns": qr.columns, "truncated": qr.truncated},
+                metadata={"db_ms": db_ms},
+            )
         return qr
 
     except asyncpg.PostgresError as exc:

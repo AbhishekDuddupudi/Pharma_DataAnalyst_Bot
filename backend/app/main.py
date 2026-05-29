@@ -2,6 +2,8 @@
 Pharma Data Analyst Bot – FastAPI entry point.
 """
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -13,6 +15,16 @@ from app.api.chat_stream import router as chat_stream_router
 from app.api.health import router as health_router
 from app.api.sessions import router as sessions_router
 from app.api.version import router as version_router
+from app.services.observability import shutdown_tracer
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Application lifespan: startup → yield → shutdown."""
+    yield
+    # Flush and terminate the Langfuse background threads gracefully so
+    # no spans are lost when the container stops.
+    shutdown_tracer()
 
 
 def create_app() -> FastAPI:
@@ -25,6 +37,7 @@ def create_app() -> FastAPI:
         version=settings.APP_VERSION,
         docs_url="/docs",
         redoc_url="/redoc",
+        lifespan=_lifespan,
     )
 
     # ── Middleware ────────────────────────────────────────────────

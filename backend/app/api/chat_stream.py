@@ -23,6 +23,7 @@ import time
 from typing import Any, AsyncGenerator
 
 from fastapi import APIRouter, Depends, Request
+from langfuse import get_client
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -47,7 +48,8 @@ from app.services.memory import (
 )
 from app.agent.workflow import run_workflow
 from app.core.logging import get_logger
-from app.services.observability import get_tracer
+from app.core.config import settings
+from app.services.observability import flush_langfuse
 
 logger = get_logger(__name__)
 
@@ -112,15 +114,6 @@ async def _generate_stream(
 
         yield _sse("session", {"session_id": session_id})
 
-        # ── Start Langfuse trace ──────────────────────────────
-        tracer = get_tracer()
-        trace = tracer.start_trace(
-            name="chat.stream",
-            request_id=request_id,
-            user_id=user_id,
-            session_id=session_id,
-            metadata={"mode": "stream", "client": "web", "streaming": True},
-        )
 
         # ── Store user message ────────────────────────────────
         await add_message(session_id, "user", body.message)
@@ -159,7 +152,7 @@ async def _generate_stream(
         async def _run_workflow():
             nonlocal workflow_state, workflow_error
             try:
-                workflow_state = await run_workflow(body.message, history, emit, memory_bundle=memory_bundle, tracer=tracer, trace=trace)
+                workflow_state = await run_workflow(body.message, history, emit, memory_bundle=memory_bundle, user_id=user_id, session_id=session_id)
             except Exception as exc:
                 workflow_error = str(exc)
                 logger.exception("Workflow error for user %s", user_id)
@@ -197,8 +190,7 @@ async def _generate_stream(
         # ── Handle error from workflow ────────────────────────
         if workflow_error:
             yield _sse("error", {"message": workflow_error})
-            tracer.finalize_trace(trace, level="ERROR", status_message=workflow_error[:200])
-            tracer.flush()
+            flush_langfuse()
             if audit_id:
                 try:
                     await finalize_audit_error(
@@ -210,9 +202,7 @@ async def _generate_stream(
             return
 
         if cancelled:
-            tracer.log_event(trace, name="stream.cancelled", level="WARNING")
-            tracer.finalize_trace(trace, level="WARNING", status_message="Client disconnected")
-            tracer.flush()
+            flush_langfuse()
             return
 
         # ── Emit metrics ──────────────────────────────────────
@@ -224,14 +214,14 @@ async def _generate_stream(
                 "db_ms": workflow_state.db_ms,
             }
 
-            # Build trace link if available
-            trace_id = getattr(trace, 'trace_id', '') or getattr(trace, 'id', '') or ''
-            trace_url = ''
-            if hasattr(trace, 'get_trace_url'):
+            # Build trace link if available (set by @observe in run_workflow)
+            trace_id = workflow_state.trace_id if workflow_state else ""
+            trace_url = ""
+            if trace_id and settings.LANGFUSE_ENABLED:
                 try:
-                    trace_url = trace.get_trace_url()
+                    trace_url = get_client().get_trace_url(trace_id=trace_id) or ""
                 except Exception:
-                    pass
+                    logger.warning("Failed to resolve Langfuse trace URL", exc_info=True)
 
             yield _sse("metrics", {
                 "total_ms": total_ms,
@@ -388,22 +378,12 @@ async def _generate_stream(
                 complete_data["blocked"] = True
                 complete_data["reason"] = workflow_state.reject_reason
         yield _sse("complete", complete_data)
-
-        # ── Finalize Langfuse trace ───────────────────────────
-        tracer.finalize_trace(trace, output={
-            "ok": complete_data.get("ok", False),
-            "total_ms": timings_ms.get("total_ms") if workflow_state else None,
-        })
-        tracer.flush()
+        flush_langfuse()
 
     except Exception as exc:
         logger.exception("Streaming error for user %s", user_id)
         yield _sse("error", {"message": str(exc)})
-        try:
-            tracer.finalize_trace(trace, level="ERROR", status_message=str(exc)[:200])
-            tracer.flush()
-        except Exception:
-            pass
+        flush_langfuse()
 
 
 # ── Endpoint ─────────────────────────────────────────────────────
