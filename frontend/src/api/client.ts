@@ -340,25 +340,25 @@ function dispatchSSEEvent(
       cb.onArtifactSql?.(d as { tasks: SqlTask[] });
       break;
     case "artifact_table":
-      cb.onArtifactTable?.(d as TableArtifact);
+      cb.onArtifactTable?.(d as unknown as TableArtifact);
       break;
     case "artifact_chart":
-      cb.onArtifactChart?.(d as ChartArtifact);
+      cb.onArtifactChart?.(d as unknown as ChartArtifact);
       break;
     case "answer_meta":
       cb.onAnswerMeta?.(d as { assumptions: string[]; follow_ups: string[] });
       break;
     case "retry":
-      cb.onRetry?.(d as RetryData);
+      cb.onRetry?.(d as unknown as RetryData);
       break;
     case "metrics":
-      cb.onMetrics?.(d as MetricsData);
+      cb.onMetrics?.(d as unknown as MetricsData);
       break;
     case "audit":
-      cb.onAudit?.(d as AuditData);
+      cb.onAudit?.(d as unknown as AuditData);
       break;
     case "complete":
-      cb.onComplete?.(d as CompleteData);
+      cb.onComplete?.(d as unknown as CompleteData);
       break;
     case "error":
       cb.onError?.(d as { message: string });

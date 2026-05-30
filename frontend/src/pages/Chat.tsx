@@ -414,17 +414,23 @@ function AssistantBlock({
   const chartSource = (aj?.chart ?? legacy?.chart ?? null) as Record<string, unknown> | null;
 
   const sqlTasks: SqlTask[] =
-    sqlSource?.map((t: Record<string, unknown>) => ({ title: String(t.title ?? ""), sql: String(t.sql ?? "") })) ??
+    sqlSource?.map((item) => {
+      const t = item as Record<string, unknown>;
+      return { title: String(t.title ?? ""), sql: String(t.sql ?? "") };
+    }) ??
     streamOverlay?.artifacts.sqlTasks ??
     [];
   const tables: TableArtifact[] =
-    tableSource?.map((t: Record<string, unknown>) => ({
-      task_title: String(t.title ?? t.task_title ?? ""),
-      columns: (t.columns ?? []) as string[],
-      rows: (t.rows ?? []) as unknown[][],
-      row_count: ((t.rows ?? []) as unknown[][]).length,
-      truncated: false,
-    })) ??
+    tableSource?.map((item) => {
+      const t = item as Record<string, unknown>;
+      return {
+        task_title: String(t.title ?? t.task_title ?? ""),
+        columns: (t.columns ?? []) as string[],
+        rows: (t.rows ?? []) as unknown[][],
+        row_count: ((t.rows ?? []) as unknown[][]).length,
+        truncated: false,
+      };
+    }) ??
     streamOverlay?.artifacts.tables ??
     [];
   const chart: ChartArtifact | null =
