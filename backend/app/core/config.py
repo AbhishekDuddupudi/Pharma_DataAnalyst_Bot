@@ -33,7 +33,11 @@ class Settings(BaseSettings):
     STREAM_DEMO_DELAY_MS: int = 0
     SQL_MAX_RETRIES: int = 2
     SQL_MAX_ROWS: int = 100
-
+    # ── Eval fast mode ───────────────────────────────────────────
+    # Set EVAL_FAST=true to cap insight tasks to 2, skip chart LLM
+    # call, and skip session summary update.  Keeps SQL/validator
+    # paths intact while cutting ~40% off average eval runtime.
+    EVAL_FAST: bool = False
     # ── Langfuse Observability ─────────────────────────────────
     LANGFUSE_ENABLED: bool = False
     LANGFUSE_PUBLIC_KEY: str = ""

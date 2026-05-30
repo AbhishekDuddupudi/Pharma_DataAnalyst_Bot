@@ -1,0 +1,3 @@
+# Ignore generated eval reports (except this .gitignore)
+*
+!.gitignore

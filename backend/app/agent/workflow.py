@@ -473,7 +473,11 @@ async def _analysis_planner(state: WorkflowState, emit: Emitter) -> None:
 
     schema_text = _schema_summary()
     memory_text = _format_memory_context(state.memory_bundle)
-    n_tasks = "3-4" if state.mode == "insights" else "1"
+    # In fast eval mode cap insight tasks to 2 to reduce LLM + SQL overhead
+    if state.mode == "insights":
+        n_tasks = "2" if settings.EVAL_FAST else "3-4"
+    else:
+        n_tasks = "1"
 
     system = (
         "You are an analysis planner for a pharmaceutical data analyst bot.\n"
@@ -736,7 +740,11 @@ async def _sql_executor_node(state: WorkflowState, emit: Emitter) -> None:
 async def _viz_builder(state: WorkflowState, emit: Emitter) -> None:
     """Node 9: suggest a chart specification."""
     await emit("status", {"step": "viz_builder", "message": "Building visualisation…"})
-
+    # Skip the chart LLM call in fast eval mode — saves ~1-2s per run
+    if settings.EVAL_FAST:
+        state.chart_spec = None
+        await emit("artifact_chart", {"available": False})
+        return
     # Find the first task with results
     task_with_data = next((t for t in state.tasks if t.result and t.result.row_count > 0), None)
     if not task_with_data or not task_with_data.result:
