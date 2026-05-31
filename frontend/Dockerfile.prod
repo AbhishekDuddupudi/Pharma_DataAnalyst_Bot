@@ -1,0 +1,23 @@
+# ── Production frontend image ─────────────────────────────────────
+# Multi-stage: build the Vite app to static assets, then serve them with
+# Nginx. This same Nginx also reverse-proxies /api to the backend, keeping
+# the single-origin model (frontend + API on one domain).
+#
+# (Local dev still uses the plain Dockerfile, which runs the Vite dev server.)
+
+# Stage 1 — build static assets
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package.json package-lock.json* ./
+RUN npm install
+COPY . .
+# VITE_API_BASE_URL defaults to the relative "/api" path, which Nginx proxies.
+RUN npm run build
+
+# Stage 2 — serve with Nginx
+FROM nginx:1.27-alpine
+# Static assets are baked in; the server config (SPA + /api proxy) is mounted
+# at runtime by docker-compose.prod.yml from ./nginx/nginx.conf.
+COPY --from=builder /app/dist /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]

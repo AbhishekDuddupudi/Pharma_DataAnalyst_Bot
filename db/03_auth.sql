@@ -31,13 +31,7 @@ CREATE INDEX IF NOT EXISTS idx_session_expires ON user_session (expires_at);
 
 COMMENT ON TABLE user_session IS 'Server-side sessions tied to httpOnly cookies.';
 
--- ── Seed: demo user ───────────────────────────────────────────
--- Password: demo123  (bcrypt, 12 rounds)
--- NOTE: credentials are documented in README only, never shown in UI.
-
-INSERT INTO app_user (email, password_hash, display_name)
-VALUES (
-    'demo@example.com',
-    '$2b$12$DkFzIWG2.Yhk7oqS3ZZ3Yu/pY6.EQh2fj1EpXxC3g7YaGZOD.GQL2',
-    'Demo User'
-) ON CONFLICT (email) DO NOTHING;
+-- ── No seeded users ───────────────────────────────────────────
+-- Users are NOT seeded here. Create the single owner/admin user
+-- with: python -m scripts.create_owner   (see backend/scripts/create_owner.py)
+-- This avoids shipping a known credential in the database.

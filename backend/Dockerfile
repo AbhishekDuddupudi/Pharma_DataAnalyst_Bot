@@ -9,4 +9,6 @@ COPY . .
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+# Production command: no --reload. (Local dev overrides this with --reload
+# via the command: key in docker-compose.yml.)
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
