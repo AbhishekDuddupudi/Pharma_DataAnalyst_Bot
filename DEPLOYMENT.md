@@ -38,6 +38,9 @@ cookie/CORS complexity.
   HTTP inside the VPC. This is the standard pattern.
 - The ALB sets **`X-Forwarded-Proto: https`**; Nginx forwards it to the backend
   ([nginx/nginx.conf](nginx/nginx.conf)).
+- The backend runs Uvicorn with trusted proxy headers, so request scheme/host
+   stay aligned with the ALB-forwarded values for any future absolute-URL or
+   redirect logic.
 - The session cookie's **`Secure`** flag is enabled by `APP_ENV=production`
   ([backend/app/security/cookies.py](backend/app/security/cookies.py)). Because
   the **browser ↔ ALB** connection is HTTPS, the browser accepts and returns the
@@ -79,27 +82,29 @@ is no Postgres container in production.
    OPENAI_API_KEY=sk-...
    ```
    (See [.env.example](.env.example) for the full list.)
-4. **Migrate the database** against RDS (idempotent):
+4. **Install the PostgreSQL client** on the EC2 host if needed (`psql` must be
+   available on `PATH`).
+5. **Migrate the database** against RDS (safe to rerun):
    ```bash
    DATABASE_URL="postgresql://USER:PASS@<rds-endpoint>:5432/pharma_db" ./db/migrate.sh
    ```
-5. **Build & start the app:**
+6. **Build & start the app:**
    ```bash
    docker compose -f docker-compose.prod.yml up -d --build
    ```
-6. **Create the owner user** (interactive, hidden password input):
+7. **Create the owner user** (interactive, hidden password input):
    ```bash
    docker compose -f docker-compose.prod.yml exec backend python -m scripts.create_owner
    ```
-7. **ACM:** request/validate a public certificate for `your-domain`.
-8. **ALB:** create an internet-facing ALB in the public subnets, attached to the
+8. **ACM:** request/validate a public certificate for `your-domain`.
+9. **ALB:** create an internet-facing ALB in the public subnets, attached to the
    ALB SG. Add an **HTTPS :443 listener** using the ACM cert, forwarding to a
    target group of the EC2 instance on **port 80**. Optionally add an **HTTP :80
    listener** that redirects to HTTPS. Set the target group health check to
    **`GET /api/health`**.
-9. **Route 53:** create an **A / alias** record for `your-domain` pointing at the
+10. **Route 53:** create an **A / alias** record for `your-domain` pointing at the
    ALB.
-10. **Verify:** browse `https://your-domain`, log in as the owner, run a query,
+11. **Verify:** browse `https://your-domain`, log in as the owner, run a query,
     and confirm the chat **streams** incrementally (SSE through Nginx + ALB).
 
 ## Operational notes

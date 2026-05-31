@@ -1,0 +1,12 @@
+# Keep the build context clean and avoid baking local artifacts/secrets in.
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+.venv/
+venv/
+.pytest_cache/
+eval/reports/
+.DS_Store
+.git

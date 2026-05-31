@@ -1,0 +1,11 @@
+# Keep the build context clean. Critically, do NOT copy the host's
+# node_modules into the image — it contains platform-specific native
+# binaries (e.g. @esbuild/darwin-arm64) that break `vite build` on Linux.
+node_modules
+dist
+.env
+.env.*
+npm-debug.log*
+*.log
+.DS_Store
+.git
