@@ -69,6 +69,11 @@ is no Postgres container in production.
 
 ## One-time deployment steps
 
+> **Warning:** [db/migrate.sh](db/migrate.sh) is a first-time bootstrap script
+> for a fresh database. It is not a routine production migration tool.
+> [db/00_schema.sql](db/00_schema.sql) contains `DROP TABLE` statements that
+> rebuild the seeded analytics model before reseeding.
+
 1. **Provision RDS PostgreSQL** (private subnets, RDS SG as above). Note the
    endpoint, username, password, and DB name (`pharma_db`).
 2. **Launch the EC2 instance** (EC2 SG as above), install Docker + the Docker
@@ -84,10 +89,11 @@ is no Postgres container in production.
    (See [.env.example](.env.example) for the full list.)
 4. **Install the PostgreSQL client** on the EC2 host if needed (`psql` must be
    available on `PATH`).
-5. **Migrate the database** against RDS (safe to rerun):
+5. **Bootstrap the database once** against a **fresh RDS database**:
    ```bash
-   DATABASE_URL="postgresql://USER:PASS@<rds-endpoint>:5432/pharma_db" ./db/migrate.sh
+   MIGRATION_CONFIRM=BOOTSTRAP DATABASE_URL="postgresql://USER:PASS@<rds-endpoint>:5432/pharma_db" ./db/migrate.sh
    ```
+   Do **not** use this script later for routine production schema changes.
 6. **Build & start the app:**
    ```bash
    docker compose -f docker-compose.prod.yml up -d --build

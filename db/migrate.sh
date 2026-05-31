@@ -4,9 +4,12 @@
 # Postgres container auto-runs must be applied manually. This script runs
 # every db/*.sql file in alphabetical order against DATABASE_URL.
 #
-# The overall sequence is safe to rerun against the app database. Individual
-# files are written to tolerate re-application where needed, and the analytics
-# reset/seed files intentionally rebuild their data each run.
+# WARNING: this is a bootstrap helper for a fresh app database. It is not a
+# general-purpose production migration system. In particular, db/00_schema.sql
+# includes DROP TABLE statements that rebuild the seeded analytics model.
+#
+# Use this for first-time initialization of a new local database or fresh RDS
+# database only. Do not use it for routine production upgrades.
 #
 # Usage:
 #   DATABASE_URL="postgresql://USER:PASS@<rds-endpoint>:5432/pharma_db" ./db/migrate.sh
@@ -24,6 +27,22 @@ fi
 if ! command -v psql >/dev/null 2>&1; then
   echo "ERROR: psql is not installed or not on PATH. Install the PostgreSQL client before running db/migrate.sh." >&2
   exit 1
+fi
+
+if [[ "${MIGRATION_CONFIRM:-}" != "BOOTSTRAP" ]]; then
+  echo "WARNING: db/migrate.sh is for first-time bootstrap of a fresh database only." >&2
+  echo "WARNING: db/00_schema.sql contains DROP TABLE statements for the seeded analytics model." >&2
+
+  if [[ -t 0 ]]; then
+    read -r -p "Type BOOTSTRAP to continue: " confirm
+    if [[ "$confirm" != "BOOTSTRAP" ]]; then
+      echo "Aborted." >&2
+      exit 1
+    fi
+  else
+    echo "ERROR: confirmation required. Re-run interactively or set MIGRATION_CONFIRM=BOOTSTRAP after verifying the target database is fresh." >&2
+    exit 1
+  fi
 fi
 
 # psql speaks libpq URLs; strip the SQLAlchemy async driver suffix if present.

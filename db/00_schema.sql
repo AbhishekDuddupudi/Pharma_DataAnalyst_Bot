@@ -3,13 +3,18 @@
 -- ================================================================
 -- Run order: 00_schema.sql → 01_seed.sql → 02_indexes.sql
 -- Postgres 16+
+-- WARNING: this bootstrap script rebuilds the analytics dataset from scratch.
+-- It is intended for first-time initialization of a fresh app database, not
+-- routine production schema migrations.
 -- ================================================================
 
 -- ── Extensions ────────────────────────────────────────────────
 
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- ── Drop existing objects (idempotent rebuild) ────────────────
+-- ── Drop existing analytics objects (destructive bootstrap reset) ─────────
+-- These DROP TABLE statements intentionally clear the seeded analytics model
+-- before recreating it. Do not run this as a normal production migration.
 
 DROP TABLE IF EXISTS fact_sales   CASCADE;
 DROP TABLE IF EXISTS messages     CASCADE;
